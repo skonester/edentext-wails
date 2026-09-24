@@ -3,7 +3,7 @@
 </p>
 
 <h1 align="center">
-  <img src="public/EdenText.png" height="40" alt="EdenText">
+  <img src="public/EdenText.png" height="40" alt="EdenText-Wails">
 </h1>
 
 <p align="center">
