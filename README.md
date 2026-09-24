@@ -24,6 +24,12 @@
 
 ---
 
+> [!TIP]
+> **This fork adds a Windows desktop app.** Get it from
+> [Releases](https://github.com/skonester/edentext/releases): the **setup** installs
+> EdenText and opens `.odt` and `.docx` files by double-click, and the **portable
+> `.exe`** runs without installing. Built with [Wails](https://wails.io).
+
 EdenText is a web-based, powerful word processor for everything from quick notes to full-length books. No server, no account — processing runs locally and your documents never leave your computer. Just one URL away, or completely offline as a slim browser app — under 2 MB on first load[^1]. The interface comes in English, German, Spanish, French, Portuguese, Russian and Chinese (simplified and traditional).
 
 > [!NOTE]
