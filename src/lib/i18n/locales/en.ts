@@ -1165,6 +1165,7 @@ const en = {
   },
   dialogs: {
     confirmNew: 'Start a new document? Any unsaved changes will be lost.',
+    confirmClose: 'Close EdenText? Any unsaved changes will be lost.',
     confirmReplace: 'Opening this file will replace the current document. Continue?',
     openedWithLimitations: (list: string) => `Opened with limitations:\n• ${list}`,
     couldNotOpen: 'Could not open this file.',

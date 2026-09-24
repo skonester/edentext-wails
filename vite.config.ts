@@ -20,7 +20,19 @@ export default defineConfig({
   // Relative asset URLs, so the same build works at the domain root and under a
   // subpath (GitHub Pages project site). sw.js and the manifest are relative too.
   base: './',
-  plugins: [svelte()],
+  plugins: [
+    svelte(),
+    // The desktop build (desktop/wails.json) leaves out the web page's visit counter
+    // and install manifest.
+    {
+      name: 'desktop-html',
+      apply: (_, { mode }) => mode === 'desktop',
+      transformIndexHtml: (html) =>
+        html
+          .replace(/\s*<!-- Anonymous visit counting[\s\S]*?<\/script>/, '')
+          .replace(/\s*<link rel="manifest"[^>]*>/, ''),
+    },
+  ],
   // The browsers the bundle promises to parse in; the CI browser matrix runs the
   // engines behind them (docs/headless-testing.md).
   build: { target: 'baseline-widely-available' },

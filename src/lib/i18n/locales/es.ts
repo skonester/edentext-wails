@@ -1154,6 +1154,7 @@ const es: Messages = {
   },
   dialogs: {
     confirmNew: '¿Empezar un documento nuevo? Se perderán los cambios sin guardar.',
+    confirmClose: '¿Cerrar EdenText? Se perderán los cambios sin guardar.',
     confirmReplace: 'Abrir este archivo sustituirá el documento actual. ¿Continuar?',
     openedWithLimitations: (list) => `Abierto con limitaciones:\n• ${list}`,
     couldNotOpen: 'No se ha podido abrir este archivo.',

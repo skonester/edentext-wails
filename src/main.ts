@@ -22,8 +22,8 @@ window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () 
 });
 
 // Offline support (public/sw.js). Not in dev, where a worker would serve the cached
-// build over the one being edited.
-if (import.meta.env.PROD && 'serviceWorker' in navigator) {
+// build over the one being edited, nor in the desktop build, which ships its files.
+if (import.meta.env.PROD && import.meta.env.MODE !== 'desktop' && 'serviceWorker' in navigator) {
     window.addEventListener('load', () => {
         navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`).catch(() => {});
     });

@@ -11,6 +11,7 @@
   import type { TiptapNode } from 'odf-kit';
   import { exportPdf, printPdf, printRaster } from './lib/export/pdf';
   import { supportsFsAccess, saveDocument, openOdt } from './lib/export/saveFile';
+  import { onDesktopFile, setCloseWarning } from './lib/utils/desktop';
   import { loadRecentFiles, rememberRecentFile, readRecentFile, forgetRecentFile, forgetRecentFiles, pruneRecentFiles, type RecentFile } from './lib/storage/recentFiles';
   import { isProtected, decryptPackage, WRONG_PASSWORD } from './lib/crypto/protect';
   import { convertUnsupportedImages } from './lib/import/imageFormats';
@@ -210,14 +211,21 @@
     }, 300);
   });
 
+  // A document with no file behind it lives in this browser alone, so closing the tab
+  // is worth the browser's warning as much as changes a file has not got yet. The
+  // same emptiness test the confirm before a new document uses.
+  let unsavedWork = $derived(documentHasFile ? dirty : tick >= 0 && isDocNonEmpty());
+
   $effect(() => {
-    // A document with no file behind it lives in this browser alone, so closing the tab
-    // is worth the browser's warning as much as changes a file has not got yet. The
-    // same emptiness test the confirm before a new document uses.
-    if (documentHasFile ? !dirty : tick < 0 || !isDocNonEmpty()) return;
+    // A desktop window never shows the browser's prompt; the shell asks with this text.
+    if (!unsavedWork) return;
     const warn = (e: BeforeUnloadEvent) => e.preventDefault();
     addEventListener('beforeunload', warn);
-    return () => removeEventListener('beforeunload', warn);
+    setCloseWarning(t().dialogs.confirmClose);
+    return () => {
+      removeEventListener('beforeunload', warn);
+      setCloseWarning('');
+    };
   });
   let selStats = $derived.by<TextStats | null>(() => {
     if (tick < 0 || !editor) return null;
@@ -955,6 +963,13 @@
       const file = await handle.getFile();
       await applyImport(new Uint8Array(await file.arrayBuffer()), handle, file.name);
     });
+  });
+
+  // The desktop shell hands over the same documents as a path's bytes, with no handle,
+  // so the first Save asks where to write.
+  $effect(() => {
+    if (!editor) return;
+    return onDesktopFile((bytes, name) => void applyImport(bytes, null, name));
   });
 
   async function handleOpen() {

@@ -1,0 +1,64 @@
+# Builds the Windows desktop app (desktop/, Wails) and attaches the installer and the
+# single portable .exe to a draft release, published by hand once checked. Its tag is
+# desktop-v<version>, outside release.yml's v* trigger, so publishing starts no web release.
+name: eden-go
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: eden-go
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: desktop/go.mod
+          cache-dependency-path: desktop/go.sum
+      # wails.json stamps the executable and the installer; it must name the app's version.
+      - run: |
+          ver=$(node -p 'require("./package.json").version')
+          test "$(node -p 'require("./desktop/wails.json").info.productVersion')" = "$ver" \
+            || { echo "desktop/wails.json productVersion does not match package.json ($ver)"; exit 1; }
+          echo "VERSION=$ver" >> "$GITHUB_ENV"
+      # The CLI at the version go.mod builds against.
+      - working-directory: desktop
+        run: go install "github.com/wailsapp/wails/v2/cmd/wails@$(go list -m -f '{{.Version}}' github.com/wailsapp/wails/v2)"
+      - run: |
+          command -v makensis || choco install nsis -y --no-progress
+          echo "C:/Program Files (x86)/NSIS" >> "$GITHUB_PATH"
+      - run: npm ci
+      - run: npm run build:desktop:installer
+      - run: |
+          mkdir out
+          mv desktop/build/bin/edentext-amd64-installer.exe "out/EdenText-$VERSION-setup.exe"
+          mv desktop/build/bin/edentext.exe "out/EdenText-$VERSION-portable.exe"
+      # A rerun replaces the assets of a draft already there. The version's changelog
+      # section carries the notes; commit subjects stand in where it has none.
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="desktop-v$VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" out/*.exe --clobber
+          else
+            awk -v h="## [$VERSION]" 'index($0, h) == 1 { p = 1; next } p && /^## \[/ { exit } p' CHANGELOG.md > notes.md
+            notes=(--generate-notes); [ -s notes.md ] && notes=(--notes-file notes.md)
+            gh release create "$tag" out/*.exe --draft --target "$GITHUB_SHA" \
+              --title "EdenText $VERSION (Windows desktop)" "${notes[@]}"
+          fi

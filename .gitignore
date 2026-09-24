@@ -13,3 +13,6 @@ shot.mjs
 tests/render-parity/FINDINGS.md
 tests/render-parity/fixtures
 docs/*-plan.md
+desktop/build/*
+!desktop/build/appicon.png
+desktop/frontend

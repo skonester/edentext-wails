@@ -1154,6 +1154,7 @@ const zhHant: Messages = {
   },
   dialogs: {
     confirmNew: '要新增文件嗎？未儲存的變更將會遺失。',
+    confirmClose: '要關閉 EdenText 嗎？未儲存的變更將會遺失。',
     confirmReplace: '開啟此檔案會取代目前的文件。要繼續嗎？',
     openedWithLimitations: (list: string) => `開啟時有下列限制：\n• ${list}`,
     couldNotOpen: '無法開啟此檔案。',

@@ -1159,6 +1159,7 @@ const de: Messages = {
   },
   dialogs: {
     confirmNew: 'Neues Dokument beginnen? Nicht gespeicherte Änderungen gehen verloren.',
+    confirmClose: 'EdenText schließen? Nicht gespeicherte Änderungen gehen verloren.',
     confirmReplace: 'Beim Öffnen dieser Datei wird das aktuelle Dokument ersetzt. Fortfahren?',
     openedWithLimitations: (list) => `Mit Einschränkungen geöffnet:\n• ${list}`,
     couldNotOpen: 'Diese Datei konnte nicht geöffnet werden.',

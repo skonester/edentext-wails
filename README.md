@@ -89,6 +89,7 @@ npm install
 npm run dev      # dev server with hot-reload
 npm test         # test suite
 npm run build    # production build → dist/
+npm run build:desktop  # desktop app → desktop/build/bin/ (needs Go and the Wails CLI)
 ```
 
 Built with Svelte 5, TypeScript, Vite and TipTap 3 (ProseMirror).

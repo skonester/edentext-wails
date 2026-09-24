@@ -7,8 +7,8 @@ Serverless, fully client-side rich-text editor that saves `.odt` and `.docx`; st
 
 ```bash
 npm run dev      # Vite dev server (hot-reload, --host)
-npm run build    # production build -> dist/
-npm run preview  # serve dist/
+npm run build    # production build -> dist/; npm run preview serves it
+npm run desktop  # Wails desktop app in desktop/ (Go); build:desktop[:installer]; see desktop/CLAUDE.md
 npm run check    # svelte-check type-check
 npm test         # Vitest once (tests/**/*.test.ts)
 npm run test:lo      # LibreOffice round trip, fuzz re-read, ODT/DOCX consistency (needs soffice)

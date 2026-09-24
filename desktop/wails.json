@@ -1,0 +1,24 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "edentext",
+  "outputfilename": "edentext",
+  "frontend:dir": "..",
+  "frontend:install": "",
+  "frontend:build": "npx vite build --mode desktop --outDir desktop/frontend/dist --emptyOutDir",
+  "frontend:dev:watcher": "npx vite --mode desktop --strictPort",
+  "frontend:dev:serverUrl": "http://localhost:5173",
+  "wailsjsdir": "./frontend",
+  "info": {
+    "companyName": "EdenText",
+    "productName": "EdenText",
+    "productVersion": "0.6.0",
+    "copyright": "AGPL-3.0-only",
+    "comments": "A rich-text editor that saves .odt and .docx",
+    "fileAssociations": [
+      { "ext": "odt", "name": "EdenText.odt", "description": "OpenDocument Text", "iconName": "appicon", "role": "Editor" },
+      { "ext": "ott", "name": "EdenText.ott", "description": "OpenDocument Text Template", "iconName": "appicon", "role": "Editor" },
+      { "ext": "docx", "name": "EdenText.docx", "description": "Word Document", "iconName": "appicon", "role": "Editor" },
+      { "ext": "dotx", "name": "EdenText.dotx", "description": "Word Template", "iconName": "appicon", "role": "Editor" }
+    ]
+  }
+}

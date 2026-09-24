@@ -1,7 +1,9 @@
-// File System Access API helpers for saving/opening documents. Falls back to a
-// plain browser download / no-op where the API is unavailable (Firefox/Safari).
+// File System Access API helpers for saving/opening documents. Falls back to the
+// desktop shell's save dialog, else a plain browser download, where the API is
+// unavailable (Firefox/Safari, the macOS and Linux webviews).
 
 import { t } from '../i18n/i18n.svelte';
+import { isDesktop, desktopSave } from '../utils/desktop';
 
 // Shown once per browser, at the first save that goes the download route — the
 // moment the missing save dialog is actually felt.
@@ -88,7 +90,8 @@ export async function saveDocument(
 ): Promise<FileSystemFileHandle | null> {
   const out = await protect(bytes, password);
   if (!supportsFsAccess()) {
-    download(out, suggestedName, FORMATS[kind].mime);
+    if (isDesktop) await desktopSave(out, suggestedName, FORMATS[kind].type.description, kind);
+    else download(out, suggestedName, FORMATS[kind].mime);
     return null;
   }
   const target = handle ?? (await (window as WinFs).showSaveFilePicker!({ suggestedName, types: [FORMATS[kind].type] }));

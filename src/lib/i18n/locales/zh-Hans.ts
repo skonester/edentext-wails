@@ -1153,6 +1153,7 @@ const zhHans: Messages = {
   },
   dialogs: {
     confirmNew: '要新建文档吗？未保存的更改将丢失。',
+    confirmClose: '要关闭 EdenText 吗？未保存的更改将丢失。',
     confirmReplace: '打开此文件将替换当前文档。要继续吗？',
     openedWithLimitations: (list: string) => `打开时有以下限制：\n• ${list}`,
     couldNotOpen: '无法打开此文件。',

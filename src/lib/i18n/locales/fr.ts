@@ -1158,6 +1158,7 @@ const fr: Messages = {
   },
   dialogs: {
     confirmNew: 'Commencer un nouveau document ? Toutes les modifications non enregistrées seront perdues.',
+    confirmClose: 'Fermer EdenText ? Toutes les modifications non enregistrées seront perdues.',
     confirmReplace: 'L’ouverture de ce fichier remplacera le document actuel. Continuer ?',
     openedWithLimitations: (list) => `Ouvert avec des limitations :\n• ${list}`,
     couldNotOpen: 'Impossible d’ouvrir ce fichier.',

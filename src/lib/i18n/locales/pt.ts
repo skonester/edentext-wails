@@ -1152,6 +1152,7 @@ const pt: Messages = {
   },
   dialogs: {
     confirmNew: 'Iniciar um novo documento? Quaisquer alterações não salvas serão perdidas.',
+    confirmClose: 'Fechar o EdenText? Quaisquer alterações não salvas serão perdidas.',
     confirmReplace: 'Abrir este ficheiro substituirá o documento atual. Continuar?',
     openedWithLimitations: (list) => `Aberto com limitações:
 • ${list}`,
