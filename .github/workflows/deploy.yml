@@ -19,6 +19,8 @@ concurrency:
 
 jobs:
   deploy:
+    # A fork has no Pages site until one is set up, so only the original repository deploys.
+    if: ${{ !github.event.repository.fork }}
     runs-on: ubuntu-latest
     environment:
       name: github-pages
