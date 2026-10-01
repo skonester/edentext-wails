@@ -1,6 +1,7 @@
 import { strFromU8 } from 'fflate';
-import { StyleResolver, NS, WATERMARK_NAME, lengthToPt, lengthToCm, layerTextProps, type PropMap } from './styleResolver';
-import { tagFromOdf } from '../storage/documentLanguage';
+import { StyleResolver, NS, WATERMARK_NAME, lengthToPt, lengthToCm, layerTextProps, langTagsOfProps, type PropMap } from './styleResolver';
+import { cjkDocFont, odfFromTag, tagFromOdf } from '../storage/documentLanguage';
+import { ASIAN_SCRIPT_RE } from '../utils/script';
 import { ODF_LOOK_ATTRS, normalizeColor } from '../export/odt';
 import { HEADING_STYLE_OVERRIDES, MAX_HEADING_LEVEL } from '../styles/headings';
 import { isAllowedUri } from '@tiptap/extension-link';
@@ -8,21 +9,21 @@ import { builtinStyleSheet, DEFAULT_STYLE, type ParaProps, type Style, type Styl
 import { DEFAULT_OUTLINE_LEVEL, MAX_OUTLINE_LEVELS, type OutlineLevel, type OutlineNumbering } from '../styles/outlineNumbering';
 import { LIST_LEVEL_STEP_CM, MAX_LIST_LEVELS, type ListLevelStyle, type ListStyle } from '../styles/listStyles';
 import { HEADER_SHADE } from '../editor/extensions/tableHeaderRow';
-import { fitInlineImage, framePx } from '../editor/extensions/image';
+import { cropOf, fitInlineImage, framePx, type Crop } from '../editor/extensions/image';
 import { odfChartDataUrl } from './chart';
 import { formatTabStops, normalizeLeader } from '../editor/extensions/tabStops';
-import type { CapsMode, LineStyle } from '../editor/extensions/textEffects';
+import { isEmphasis, type CapsMode, type LineStyle } from '../editor/extensions/textEffects';
 import {
   TABLE_REGIONS, builtinTableStyles, parseTableLook, resolveTableCell, tableLookAttr,
   type TableLook, type TableRegion,
 } from '../styles/tableStyles';
-import { orderedTypeFromFormat, orderedTypeAttrAt, childCycle, ROOT_ORDERED_CYCLE, type OrderedCycle } from '../utils/orderedListTypes';
+import { knownNumFormat, orderedTypeFromFormat, orderedTypeAttrAt, childCycle, ROOT_ORDERED_CYCLE, type OrderedCycle } from '../utils/orderedListTypes';
 import { bulletCharAttr, bulletCharFromOdf } from '../utils/bulletListTypes';
 import { docxPicture, matchFormat, toDateValue, type Token } from '../utils/dateTime';
 import {
   shapeFromOdfType, lineKindFor, parseSvgPath, parseOdfPoints, fitPath, type ShapeKind,
 } from '../utils/shapes';
-import { imageDataUrl, placeholderImage, unzipArchive, type ConvertedImages } from './imageFormats';
+import { imageDataUrl, imageSizeCm, placeholderImage, unzipArchive, type ConvertedImages } from './imageFormats';
 import { boundedInt, IMPORT_LIMITS, parseImportXml } from './importLimits';
 import { astToLatex } from '../math/latex';
 import { parseMathml } from '../math/mathml';
@@ -31,27 +32,25 @@ import type { Orientation } from '../storage/pageOrientation';
 import type { SpacingModel } from '../storage/spacingModel';
 import { pageDimsCm, type PageFormat } from '../storage/pageFormat';
 import { languageFromOdf, NO_LANGUAGE, type DocumentLanguage } from '../storage/documentLanguage';
-import type { HfDistances, HfDoc, HfSet } from '../storage/headerFooter';
+import { hfIsEmpty, type HfDistances, type HfDoc, type HfSet } from '../storage/headerFooter';
 import { NOTE_FONT_SIZE_PT, NOTE_INDENT_CM, type NoteKind, type NoteNumFormat, type NoteSettings } from '../storage/noteSettings';
 import { EMPTY_DOC_PROPERTIES, type DocProperties } from '../storage/docProperties';
 import { clampPageStart, type PageNumbering } from '../storage/pageNumbering';
 import { newCommentId } from '../editor/extensions/comment';
 import { ODF_SEQ_CATEGORY } from '../editor/extensions/caption';
 import { isCrossRefFormat } from '../editor/extensions/crossReference';
-import type { IndexKind } from '../editor/extensions/tableOfContents';
+import type { IndexKind, TocEntry } from '../editor/extensions/tableOfContents';
 import { isBibType } from '../editor/extensions/bibliographyEntry';
 import { citationStyleFromTemplate } from '../utils/citationStyle';
 import type { PageDecor } from '../storage/pageDecor';
 import { FOLD_MARK_NAME } from '../storage/foldMarks';
 import type { LineNumbering } from '../storage/lineNumbering';
+import type { LineGrid } from '../storage/lineGrid';
 import type { EmbeddedFont } from '../fonts/embeddedFonts';
 import { cellPaddingAttr, DEFAULT_CELL_PADDING, type CellPadding } from '../editor/extensions/tableCellPadding';
 import { fromWriterFormula } from '../utils/tableFormula';
 import { cellFormatFromSpec, type CellFormat, type FormatKind } from '../utils/cellFormat';
 import { TEXTBOX_PADDING_CM } from '../editor/extensions/textBox';
-import { getSchema } from '@tiptap/core';
-import type { Schema } from '@tiptap/pm/model';
-import { hfExtensions } from '../editor/extensions/headerFooter';
 
 // .odt → TipTap JSON, inverting export/odt.ts. Editor-expressible content becomes its
 // native node/mark/attr; values matching the editor's defaults are suppressed so round
@@ -77,6 +76,10 @@ export interface OdtImportResult {
   // Page background, page border and watermark (storage/pageDecor.ts).
   decor: PageDecor;
   lineNumbering: LineNumbering;
+  lineGrid: LineGrid;
+  // Every space at half the font size (settings.xml BalanceSpacesAndIdeographicSpaces,
+  // Word's w:balanceSingleByteDoubleByteWidth).
+  balanceSpaces: boolean;
   // Fold + punch marks in the left margin (the export's named header lines).
   foldMarks: boolean;
   // Automatic hyphenation (ODF fo:hyphenate on the base style, Word w:autoHyphenation).
@@ -92,7 +95,7 @@ export interface OdtImportResult {
   // (settings.xml AddParaTableSpacing=false, what LibreOffice writes for a Word import).
   spacingModel: SpacingModel;
   spacingAtPageStart: boolean;
-  // Single-paragraph docs in the hfExtensions schema; null = no zone.
+  // Zone docs in the zoneExtensions schema; null = no zone.
   header: HfDoc;
   footer: HfDoc;
   // First-page variants (Word "Different First Page" / ODF header-first). null when
@@ -114,6 +117,8 @@ export interface OdtImportResult {
   // Document spell-check language; NO_LANGUAGE when the file's language has no
   // bundled dictionary; null when the file declares none.
   language: DocumentLanguage | null;
+  // The tag of the default language in the other slot (western or asian), null where none.
+  languageOther?: string | null;
   // Fonts embedded in the package, to register via FontFace so they render.
   fonts: EmbeddedFont[];
   // The document's named paragraph styles: the file's own (only those it uses, plus
@@ -128,7 +133,7 @@ export interface OdtImportResult {
 
 // Where a block sits: only 'body' takes page breaks/columns/TOCs, and a 'list'
 // paragraph's indent lives in the list style rather than its own margin.
-type BlockKind = 'body' | 'list' | 'cell';
+type BlockKind = 'body' | 'list' | 'cell' | 'zone';
 
 // `files` is the full unzipped archive so image converters can read Pictures/ binaries;
 // imageCache dedupes repeated hrefs into one data-URI.
@@ -153,6 +158,9 @@ type Ctx = {
   // `docContentWidthCm` is the first section's, where the export keeps an index's stop.
   contentWidthCm: number;
   docContentWidthCm: number;
+  // The section's left page margin: a frame placed against the page is kept against the
+  // text column, as the DOCX importer keeps it.
+  leftMarginCm: number;
   // The page's own direction: a block declaring the same one is inheriting, not
   // formatted, so only a block that differs carries a `dir` attr.
   pageRtl: boolean;
@@ -185,6 +193,8 @@ type Ctx = {
   notes: { id: string; kind: NoteKind; label: string | null; text: string; content: Node[]; styleName: string | null }[];
   // Set when a header carries the export's named fold-mark lines (storage/foldMarks.ts).
   foldMarks: boolean;
+  // Converting a header/footer zone: page fields, no notes, comments or revisions.
+  zone?: boolean;
 };
 
 // Read a Pictures/ entry into a base64 data-URI; null when it's missing or in a format
@@ -266,7 +276,18 @@ function boxTextFlow(el: Element, ctx: Ctx, attrs: Record<string, unknown>): voi
   if (anchor === 'middle' || anchor === 'bottom') attrs.textVAlign = anchor;
 }
 
-function applyFrameRotationAndWrap(el: Element, attrs: Record<string, unknown>, gp: PropMap, contentCm = 0): void {
+// Nothing floats a run-through picture to a side, so its alignment in the column
+// becomes the x that alignment gives, as the DOCX leg does for wrapNone.
+function pictureAlignX(frame: Element, attrs: Record<string, unknown>, gp: PropMap, contentCm: number): void {
+  const hpos = gp['style:horizontal-pos'], rel = gp['style:horizontal-rel'];
+  const w = lengthToCm(frame.getAttributeNS(NS.svg, 'width'));
+  if (attrs.wrap !== 'through' || attrs.wrapOffset != null || w == null || !contentCm) return;
+  if (rel && rel !== 'paragraph' && rel !== 'paragraph-content' && rel !== 'page-content') return;
+  const x = hpos === 'right' ? contentCm - w : hpos === 'center' ? (contentCm - w) / 2 : null;
+  if (x != null) attrs.wrapOffset = Math.round(x * 100) / 100;
+}
+
+function applyFrameRotationAndWrap(el: Element, attrs: Record<string, unknown>, gp: PropMap, contentCm = 0, leftMarginCm = 0): void {
   const deg = frameRotationDeg(el);
   if (deg) attrs.rotation = deg;
   const anchor = el.getAttributeNS(NS.text, 'anchor-type');
@@ -287,9 +308,15 @@ function applyFrameRotationAndWrap(el: Element, attrs: Record<string, unknown>, 
     if (dist != null && dist > 0) attrs.wrapDist = Math.round(dist * 1000) / 1000;
   }
   // A frame placed by coordinate (style:horizontal-pos="from-left") keeps its x in the
-  // column; the wrap mode alone would snap it to a side.
+  // column; the wrap mode alone would snap it to a side. An x the file measures from the
+  // page edge (or the start margin, which begins there) counts from the column here too.
   const hpos = gp['style:horizontal-pos'];
-  const x = hpos === 'from-left' ? lengthToCm(el.getAttributeNS(NS.svg, 'x')) : null;
+  const hrel = gp['style:horizontal-rel'];
+  const pageX = hrel === 'page' || hrel === 'page-start-margin' ? leftMarginCm : 0;
+  // Set against the page's left edge is x 0 there: a cover picture filling the sheet.
+  const rawX = hpos === 'from-left' ? lengthToCm(el.getAttributeNS(NS.svg, 'x'))
+    : hpos === 'left' && pageX ? 0 : null;
+  const x = rawX == null ? null : rawX - pageX;
   if (x != null && attrs.wrap) attrs.wrapOffset = Math.round(x * 100) / 100;
   // Where the file names no side (parallel/dynamic), the text takes whichever side of
   // the frame has room: a frame set past the middle of the column is a float on the
@@ -304,13 +331,17 @@ function applyFrameRotationAndWrap(el: Element, attrs: Record<string, unknown>, 
   // Likewise down the page — against the anchor paragraph, or against the top of the
   // page it lands on (`page`, which is how LibreOffice writes a Word cover block; the
   // node view resolves the page, so the frame stays in the flow it is anchored in).
+  // `page-content` counts from where the page's body text begins, below its header.
   const rel = gp['style:vertical-rel'];
   const fromPage = rel === 'page';
-  const y = gp['style:vertical-pos'] === 'from-top' && (!rel || rel.startsWith('paragraph') || rel === 'line' || fromPage)
-    ? lengthToCm(el.getAttributeNS(NS.svg, 'y')) : null;
-  if (y != null && attrs.wrap && (fromPage || y > 0)) {
+  const fromBody = rel === 'page-content';
+  const vpos = gp['style:vertical-pos'];
+  const y = vpos === 'from-top' && (!rel || rel.startsWith('paragraph') || rel === 'line' || fromPage || fromBody)
+    ? lengthToCm(el.getAttributeNS(NS.svg, 'y')) : vpos === 'top' && (fromPage || fromBody) ? 0 : null;
+  if (y != null && attrs.wrap && (fromPage || fromBody || y > 0 || (attrs.wrap === 'through' && y < 0))) {
     attrs.wrapOffsetY = Math.round(y * 100) / 100;
     if (fromPage) attrs.wrapFromPage = true;
+    if (fromBody) attrs.wrapFromBody = true;
   }
   // A page-anchored frame is out of the text flow, placed from its page's corner: the
   // cover graphic or watermark of a title page. Its offsets are that corner's, not the
@@ -349,14 +380,14 @@ export function applyUniformRunFont(attrs: Record<string, unknown>, content: { t
 }
 
 // A top-and-bottom frame set below its paragraph's top sinks behind the paragraph's
-// text: a full-width float pushes every following line under itself, so where there is
-// text the offset can only be drawn as the lines standing above the frame.
+// text: a full-width float pushes every following line under itself, so the offset can
+// only be drawn as what stands above the frame — which is why frames go top to bottom.
 export function sinkOffsetFrames(content: { type: string; text?: string; attrs?: Record<string, unknown> }[]): void {
   const sinks = (n: { type: string; attrs?: Record<string, unknown> }) =>
     (n.type === 'image' || n.type === 'textBox')
     && n.attrs?.wrap === 'topBottom' && (n.attrs.wrapOffsetY as number) > 0;
-  if (!content.some(sinks) || !content.some(n => n.type === 'text' && n.text?.trim())) return;
-  const frames = content.filter(sinks);
+  if (!content.some(sinks)) return;
+  const frames = content.filter(sinks).sort((a, b) => (a.attrs!.wrapOffsetY as number) - (b.attrs!.wrapOffsetY as number));
   for (const f of frames) content.splice(content.indexOf(f), 1);
   content.push(...frames);
 }
@@ -419,9 +450,22 @@ function convertFrame(frame: Element, ctx: Ctx): Node | null {
   if (hCm != null) attrs.height = framePx(cmToPx(hCm));
   const title = frame.getElementsByTagNameNS(NS.svg, 'title')[0]?.textContent;
   if (title) attrs.alt = title;
-  applyFrameRotationAndWrap(frame, attrs, ctx.resolver.graphicProps(frame.getAttributeNS(NS.draw, 'style-name')), ctx.contentWidthCm);
+  const gp = ctx.resolver.graphicProps(frame.getAttributeNS(NS.draw, 'style-name'));
+  const crop = clipCrop(gp['fo:clip'], ctx.files[href]);
+  if (crop) attrs.crop = crop;
+  applyFrameRotationAndWrap(frame, attrs, gp, ctx.contentWidthCm, ctx.leftMarginCm);
+  pictureAlignX(frame, attrs, gp, ctx.contentWidthCm);
   if (!attrs.wrap || attrs.wrap === 'inline') fitInlineImage(attrs, Math.floor(cmToPx(ctx.contentWidthCm)));
   return { type: 'image', attrs };
+}
+
+// fo:clip="rect(top, right, bottom, left)" cuts lengths off the picture at its own size.
+function clipCrop(clip: unknown, bytes: Uint8Array | undefined): Crop | null {
+  const m = typeof clip === 'string' ? /rect\(([^)]*)\)/.exec(clip) : null;
+  const size = m && bytes ? imageSizeCm(bytes) : null;
+  if (!m || !size) return null;
+  const [t, r, b, l] = m[1].split(/[\s,]+/).filter(Boolean).map((v) => Math.max(0, lengthToCm(v) ?? 0));
+  return cropOf({ l: l / size.w, t: t / size.h, r: r / size.w, b: b / size.h });
 }
 
 // A shape's fill color; fo:background-color (LibreOffice's per-shape fill) beats draw:fill.
@@ -513,13 +557,19 @@ export function unnestBoxes(blocks: Node[], ctx: { warnings: Set<string> }): Nod
 // box), else the frame's computed svg:height (LibreOffice re-saves).
 function convertTextBoxFrame(frame: Element, textBoxEl: Element, ctx: Ctx): Node {
   const attrs: Record<string, unknown> = {};
-  const wCm = lengthToCm(frame.getAttributeNS(NS.svg, 'width'));
+  // A floating frame that grows with its text (fo:min-width, no width) spans what its
+  // anchor leaves it: LibreOffice lays it out at the column's width (probed).
+  const minCm = lengthToCm(textBoxEl.getAttributeNS(NS.fo, 'min-width'));
+  const xCm = lengthToCm(frame.getAttributeNS(NS.svg, 'x')) ?? 0;
+  const spans = minCm != null && frame.getAttributeNS(NS.text, 'anchor-type') !== 'as-char';
+  const wCm = lengthToCm(frame.getAttributeNS(NS.svg, 'width'))
+    ?? (spans ? Math.max(minCm, Math.round((ctx.contentWidthCm - xCm) * 1000) / 1000) : minCm);
   if (wCm != null) attrs.width = framePx(cmToPx(wCm));
   const hCm = lengthToCm(textBoxEl.getAttributeNS(NS.fo, 'min-height'))
     ?? lengthToCm(frame.getAttributeNS(NS.svg, 'height'));
   if (hCm != null) attrs.height = framePx(cmToPx(hCm));
   const gp = ctx.resolver.graphicProps(frame.getAttributeNS(NS.draw, 'style-name'));
-  applyFrameRotationAndWrap(frame, attrs, gp, ctx.contentWidthCm);
+  applyFrameRotationAndWrap(frame, attrs, gp, ctx.contentWidthCm, ctx.leftMarginCm);
   boxWrapAlign(gp, attrs);
   const padCm = lengthToCm(gp['fo:padding']);
   if (padCm != null && Math.abs(padCm - TEXTBOX_PADDING_CM) > 0.01) attrs.paddingCm = Math.round(padCm * 1000) / 1000;
@@ -561,7 +611,9 @@ function convertChartFrame(frame: Element, ctx: Ctx): Node | null {
   const src = doc && odfChartDataUrl(doc, cmToPx(wCm), cmToPx(hCm));
   if (!src) return null;
   const attrs: Record<string, unknown> = { src, width: framePx(cmToPx(wCm)), height: framePx(cmToPx(hCm)), alt: 'Chart' };
-  applyFrameRotationAndWrap(frame, attrs, ctx.resolver.graphicProps(frame.getAttributeNS(NS.draw, 'style-name')), ctx.contentWidthCm);
+  const gp = ctx.resolver.graphicProps(frame.getAttributeNS(NS.draw, 'style-name'));
+  applyFrameRotationAndWrap(frame, attrs, gp, ctx.contentWidthCm, ctx.leftMarginCm);
+  pictureAlignX(frame, attrs, gp, ctx.contentWidthCm);
   if (!attrs.wrap || attrs.wrap === 'inline') fitInlineImage(attrs, Math.floor(cmToPx(ctx.contentWidthCm)));
   return { type: 'image', attrs };
 }
@@ -631,7 +683,7 @@ function convertShape(el: Element, ctx: Ctx): Node | null {
   if (wCm != null) attrs.width = framePx(cmToPx(wCm));
   if (hCm != null) attrs.height = framePx(cmToPx(hCm));
   const gp = ctx.resolver.graphicProps(el.getAttributeNS(NS.draw, 'style-name'));
-  applyFrameRotationAndWrap(el, attrs, gp, ctx.contentWidthCm);
+  applyFrameRotationAndWrap(el, attrs, gp, ctx.contentWidthCm, ctx.leftMarginCm);
   boxWrapAlign(gp, attrs);
   shapeStyleAttrs(gp, attrs, true);
   boxTextFlow(el, ctx, attrs);
@@ -677,7 +729,7 @@ function convertFreeform(el: Element, ctx: Ctx): Node | null {
     shapePath: path, width: framePx(cmToPx(wCm)), height: framePx(cmToPx(hCm)),
   };
   const gp = ctx.resolver.graphicProps(el.getAttributeNS(NS.draw, 'style-name'));
-  applyFrameRotationAndWrap(el, attrs, gp, ctx.contentWidthCm);
+  applyFrameRotationAndWrap(el, attrs, gp, ctx.contentWidthCm, ctx.leftMarginCm);
   boxWrapAlign(gp, attrs);
   shapeStyleAttrs(gp, attrs, true);
   return { type: 'textBox', attrs, content: [{ type: 'paragraph' }] };
@@ -698,7 +750,7 @@ function convertLine(el: Element, ctx: Ctx): Node | null {
   };
   // The editor draws a line across its frame, so only the direction is left to keep.
   if ((y2 - y1) * (x2 - x1) < 0) attrs.flipV = true;
-  applyFrameRotationAndWrap(el, attrs, gp, ctx.contentWidthCm);
+  applyFrameRotationAndWrap(el, attrs, gp, ctx.contentWidthCm, ctx.leftMarginCm);
   boxWrapAlign(gp, attrs);
   shapeStyleAttrs(gp, attrs, true);
   return { type: 'textBox', attrs, content: [{ type: 'paragraph' }] };
@@ -779,13 +831,11 @@ const HEADING_DEFAULTS = HEADING_STYLE_OVERRIDES.map(h => ({
 const DEFAULT_FONTS = new Set(['times new roman', 'liberation serif']);
 const DEFAULT_HEADING_FONTS = new Set(['arial', 'liberation sans']);
 
-// ODF line spacing multiplies the font's natural line height; see lineHeight.ts.
-const LINE_HEIGHT_RATIO = 1.15;
-
 // odf-kit emits each list level at margin-left = level × 1.27cm (label-alignment).
 // A top-level list's margin beyond this level-1 base is its whole-list indent.
 const LIST_BASE_MARGIN_CM = 1.27;
 const LIST_INDENT_EPS_CM = 0.05;
+const LIST_HANGING_CM = 0.635; // the hang every list export writes (export/docx.ts)
 
 // ---- entry --------------------------------------------------------------------
 
@@ -833,7 +883,7 @@ export function importOdt(bytes: Uint8Array, convertedImages: ConvertedImages = 
   const first = resolver.hasMasterPage(masters.leading) ? masters.leading : null;
   const geo = resolver.pageGeometry(first) ?? resolver.pageGeometry();
   const contentWidthCm = contentWidthOf(geo);
-  const ctx: Ctx = { resolver, styleNames, usedStyles: new Set(), charStyleNames, usedCharStyles: new Set(), usedListStyles: new Set(), warnings, seqRefNames: sequenceRefNames(body), files, imageCache: new Map(), convertedImages, contentWidthCm, docContentWidthCm: contentWidthCm, pageRtl: geo?.rtl ?? false, masterPages: [], leadingMaster: masters.leading ?? 'Standard', masterPageStarts: [], bodyBlocks: 0, openBookmarks: new Map(), pointBookmarks: new Set(), openComments: new Map(), commentReplies: odfCommentReplies(body), revisions: odfRevisions(body), openInsertions: new Map(), notes: [], foldMarks: false };
+  const ctx: Ctx = { resolver, styleNames, usedStyles: new Set(), charStyleNames, usedCharStyles: new Set(), usedListStyles: new Set(), warnings, seqRefNames: sequenceRefNames(body), files, imageCache: new Map(), convertedImages, contentWidthCm, docContentWidthCm: contentWidthCm, leftMarginCm: geo?.margins.left ?? 0, pageRtl: geo?.rtl ?? false, masterPages: [], leadingMaster: masters.leading ?? 'Standard', masterPageStarts: [], bodyBlocks: 0, openBookmarks: new Map(), pointBookmarks: new Set(), openComments: new Map(), commentReplies: odfCommentReplies(body), revisions: odfRevisions(body), openInsertions: new Map(), notes: [], foldMarks: false };
   let blocks = convertBlocks(Array.from(body.children), ctx, 'body');
   if (blocks.length === 0) blocks.push({ type: 'paragraph' });
   pairAlignedFrames(blocks, Math.floor(cmToPx(contentWidthCm)));
@@ -869,7 +919,8 @@ export function importOdt(bytes: Uint8Array, convertedImages: ConvertedImages = 
     if (data) fonts.push({ family: s.family, weight: s.weight, style: s.style, data });
   }
 
-  const odfLang = resolver.documentLanguage();
+  const docLangs = resolver.documentLanguage();
+  const odfLang = docLangs.main ? odfFromTag(docLangs.main) : null;
   let language: DocumentLanguage | null = null;
   if (odfLang) {
     const code = languageFromOdf(odfLang.language, odfLang.country || undefined);
@@ -877,24 +928,25 @@ export function importOdt(bytes: Uint8Array, convertedImages: ConvertedImages = 
       language = code;
     } else {
       language = NO_LANGUAGE;
-      const tag = odfLang.country ? `${odfLang.language}-${odfLang.country}` : odfLang.language;
-      warnings.add(`Spell-check language "${tag}" has no bundled dictionary — spell check was turned off`);
+      warnings.add(`Spell-check language "${docLangs.main}" has no bundled dictionary — spell check was turned off`);
     }
   }
 
   const docNumFormat = resolver.pageNumberFormat(first);
-  const headerFirst = hf.headerFirst ? convertHfZone(hf.headerFirst, ctx, hf.headerBandCm) : null;
-  const footerFirst = hf.footerFirst ? convertHfZone(hf.footerFirst, ctx, hf.footerBandCm, true) : null;
+  const zoneOf = (el: Element | null, footer = false) =>
+    (el ? convertHfZone(el, ctx, geo, footer ? hf.footerBandCm : hf.headerBandCm, footer) : null);
+  const headerFirst = zoneOf(hf.headerFirst);
+  const footerFirst = zoneOf(hf.footerFirst, true);
   // The presence of a first-page element is the flag, even when it's empty (an empty
   // first-page zone deliberately blanks page 1 while the default fills later pages).
   const differentFirstPage = !!(hf.headerFirst || hf.footerFirst || hf.firstPageOnly);
   const differentOddEven = !!(hf.headerLeft || hf.footerLeft);
-  const header = hf.header ? convertHfZone(hf.header, ctx, hf.headerBandCm) : null;
-  const footer = hf.footer ? convertHfZone(hf.footer, ctx, hf.footerBandCm, true) : null;
+  const header = zoneOf(hf.header);
+  const footer = zoneOf(hf.footer, true);
   // Odd/even is per zone in ODF: a master that gives only the footer a left variant
   // repeats its header on left pages. An element that is *there* but empty blanks it.
-  const headerEven = hf.headerLeft ? convertHfZone(hf.headerLeft, ctx, hf.headerBandCm) : differentOddEven ? header : null;
-  const footerEven = hf.footerLeft ? convertHfZone(hf.footerLeft, ctx, hf.footerBandCm, true) : differentOddEven ? footer : null;
+  const headerEven = hf.headerLeft ? zoneOf(hf.headerLeft) : differentOddEven ? header : null;
+  const footerEven = hf.footerLeft ? zoneOf(hf.footerLeft, true) : differentOddEven ? footer : null;
   // A first-page/even zone reserves the band even if its default counterpart is empty.
   const hasHeader = hf.header || headerFirst || headerEven;
   const hasFooter = hf.footer || footerFirst || footerEven;
@@ -907,6 +959,7 @@ export function importOdt(bytes: Uint8Array, convertedImages: ConvertedImages = 
     rtl: geometry?.rtl ?? false,
     decor: resolver.pageDecor(first),
     lineNumbering: resolver.lineNumbering(),
+    lineGrid: resolver.lineGrid(),
     foldMarks: ctx.foldMarks,
     hyphenate: resolver.documentHyphenation(),
     recordChanges: odfRecordChanges(body),
@@ -914,6 +967,7 @@ export function importOdt(bytes: Uint8Array, convertedImages: ConvertedImages = 
     tabIntervalCm: resolver.defaultTabInterval(),
     spacingModel: odfSpacingModel(files),
     spacingAtPageStart: odfSpacingAtPageStart(files),
+    balanceSpaces: /BalanceSpacesAndIdeographicSpaces"[^>]*>true</.test(files['settings.xml'] ? strFromU8(files['settings.xml']) : ''),
     header,
     footer,
     headerFirst,
@@ -929,6 +983,7 @@ export function importOdt(bytes: Uint8Array, convertedImages: ConvertedImages = 
     headerDistanceCm: hasHeader ? edge?.top ?? null : null,
     footerDistanceCm: hasFooter ? edge?.bottom ?? null : null,
     language,
+    languageOther: docLangs.other,
     fonts,
     styles: collectStyleSheet(resolver, ctx),
     notes: resolver.noteSettings(),
@@ -945,8 +1000,9 @@ function hfSetOfMasterPage(
   docEdge: { top: number; bottom: number } | null,
 ): HfSet {
   const hf = ctx.resolver.masterPageHF(name);
+  // Its zones measure against the section's own page layout (`geo`, below).
   const zone = (el: Element | null, footer = false) =>
-    (el ? convertHfZone(el, ctx, footer ? hf.footerBandCm : hf.headerBandCm, footer) : null);
+    (el ? convertHfZone(el, ctx, geo, footer ? hf.footerBandCm : hf.headerBandCm, footer) : null);
   // Odd/even is per zone: an absent left variant repeats the default one on left pages.
   const oddEven = !!(hf.headerLeft || hf.footerLeft);
   // Its page layout is the section's own geometry; where the master hands over, that
@@ -995,144 +1051,36 @@ function hfSetOfMasterPage(
   };
 }
 
-// A header/footer zone → one single-paragraph doc (hfExtensions schema). Multiple
-// paragraphs collapse to hard line breaks; block structures flatten to their text.
-// `bandCm` is the zone's own gap to the body plus its padding: space inside the band,
-// so it rides the collapsed paragraph's spacing on the side facing the body.
-function convertHfZone(zoneEl: Element, ctx: Ctx, bandCm = 0, footer = false): HfDoc {
-  const inline: Node[] = [];
-  let textAlign: string | null = null;
-  let stops: string | null = null;
-  const boxMaps: Record<string, string>[] = [];
-
-  // The zone's paragraphs collapse into one, so their spacing becomes its own: what the
-  // band has to be tall enough to hold (Editor.svelte's hfReachPx). The **last**
-  // paragraph's own margin-bottom is not part of it — probed: a header of one 10pt line
-  // with a 12mm bottom margin puts the body at min-height, and a footer's is dropped the
-  // same way, while every margin *between* two of its paragraphs counts in full.
-  let spaceBefore: number | null = null;
-  let between = 0;
-  let prevBottomPt = 0;
-  // A zone paragraph's own padding is band height too, and the collapsed paragraph has
-  // no padding of its own to carry it — so it joins the spacing on its own side.
-  let padTopPt = 0;
-  let padBottomPt = 0;
-
-  // Counted, not measured by what came out: a zone of nothing but empty paragraphs is
-  // still that many lines tall in both products, and its breaks are what reserves them.
-  let paras = 0;
-  let styleFontPt: number | null = null;
-  const addPara = (p: Element) => {
-    if (paras++) inline.push({ type: 'hardBreak' });
-    const styleName = p.getAttributeNS(NS.text, 'style-name');
-    styleFontPt ??= lengthToPt(ctx.resolver.paraTextProps(styleName)['fo:font-size']) ?? null;
-    const outer = ctx.resolver.paraProps(styleName);
-    const topPt = snapPt(lengthToPt(outer['fo:margin-top']) ?? 0);
-    if (spaceBefore == null) spaceBefore = topPt; else between += prevBottomPt + topPt;
-    prevBottomPt = snapPt(lengthToPt(outer['fo:margin-bottom']) ?? 0);
-    const pad = lengthToPt(outer['fo:padding']);
-    padTopPt += lengthToPt(outer['fo:padding-top']) ?? pad ?? 0;
-    padBottomPt += lengthToPt(outer['fo:padding-bottom']) ?? pad ?? 0;
-    // The zone is one paragraph, so the first line's stops are the zone's.
-    stops ??= formatTabStops(ctx.resolver.tabStops(styleName));
-    if (textAlign === null) {
-      const ta = ctx.resolver.paraProps(styleName)['fo:text-align'] ?? '';
-      textAlign = ta === 'center' || ta === 'justify' ? ta : ta === 'right' || ta === 'end' ? 'right' : null;
-      if (textAlign === null) textAlign = ''; // only the first paragraph decides
-    }
-    boxMaps.push(paraBoxAttrs(ctx.resolver.paraProps(styleName)));
-    inline.push(...convertInline(p, ctx, ctx.resolver.paraTextProps(styleName), blockDefaults(ctx.resolver, null, null, false), true));
+// A header/footer zone → a zone doc, through the body's block converter at the section's
+// text width. `bandCm` is the zone's own gap to the body plus its padding: space inside
+// the band, so it rides the spacing of the block facing the body. The **last**
+// paragraph's own margin-bottom is not part of the band — probed: a header of one 10pt
+// line with a 12mm bottom margin puts the body at min-height, and a footer's is dropped
+// the same way, while every margin *between* two of its paragraphs counts in full.
+function convertHfZone(zoneEl: Element, ctx: Ctx, geo: Parameters<typeof contentWidthOf>[0], bandCm = 0, footer = false): HfDoc {
+  const zoneCtx: Ctx = {
+    ...ctx, zone: true, contentWidthCm: contentWidthOf(geo), leftMarginCm: geo?.margins.left ?? ctx.leftMarginCm, foldMarks: false,
+    openBookmarks: new Map(), pointBookmarks: new Set(), openComments: new Map(), openInsertions: new Map(),
   };
-
-  // A text box in a zone has no block node to live in, so its paragraphs become lines of
-  // the zone ahead of the one anchoring it — which is what Word's own converter makes of
-  // the same document, and what keeps the band as tall as LibreOffice lays it out.
-  const boxLines = (p: Element) => {
-    for (const frame of Array.from(p.getElementsByTagNameNS(NS.draw, 'frame'))) {
-      const box = frame.getElementsByTagNameNS(NS.draw, 'text-box')[0];
-      if (!box) continue;
-      ctx.warnings.add('Text boxes in headers or footers were flattened to text');
-      for (const inner of Array.from(box.children)) {
-        if (inner.namespaceURI === NS.text && (inner.localName === 'p' || inner.localName === 'h')) addPara(inner);
-      }
-    }
-  };
-
-  for (const child of Array.from(zoneEl.children)) {
-    if (child.namespaceURI === NS.text && (child.localName === 'p' || child.localName === 'h')) {
-      boxLines(child);
-      addPara(child);
-    } else if (child.namespaceURI === NS.text || child.namespaceURI === NS.table) {
-      // Lists/tables in headers are beyond the one-paragraph model — keep their text.
-      ctx.warnings.add('Lists/tables in headers or footers were flattened to text');
-      for (const p of Array.from(child.getElementsByTagNameNS(NS.text, 'p'))) addPara(p);
-    }
+  const blocks = convertBlocks(Array.from(zoneEl.children), zoneCtx, 'zone');
+  if (zoneCtx.foldMarks) ctx.foldMarks = true;
+  const zone: HfDoc = { type: 'doc', content: blocks };
+  if (hfIsEmpty(zone)) return null;
+  const paras = Array.from(zoneEl.children).filter((c) => c.namespaceURI === NS.text && (c.localName === 'p' || c.localName === 'h'));
+  const margin = (p: Element | undefined, side: string) =>
+    snapPt(lengthToPt(ctx.resolver.paraProps(p?.getAttributeNS(NS.text, 'style-name') ?? null)[`fo:margin-${side}`]) ?? 0);
+  const bandPt = snapPt((bandCm / 2.54) * 72);
+  const first = blocks[0];
+  const last = blocks[blocks.length - 1];
+  const isText = (b: Node | undefined) => b?.type === 'paragraph' || b?.type === 'heading';
+  if (footer && isText(first) && bandPt) {
+    first.attrs = { ...first.attrs, spaceBefore: snapPt(margin(paras[0], 'top') + bandPt) };
   }
-  // Empty source paragraphs become blank lines (hardBreaks); an all-empty zone has no
-  // runs and no inter-paragraph break, so inline stays empty. Keep such a zone only when
-  // it carries a background/rule line (a footer that is just a colored line has no text).
-  const box = mergeHfBox(boxMaps);
-  const content = fitZoneSchema(inline);
-  if (content.length === 0 && Object.keys(box).length === 0) return null;
-
-  const para: Node = { type: 'paragraph', content };
-  const attrs: Record<string, string | number> = {};
-  // The zone is one paragraph here, so its strut is the whole band's line height —
-  // runs that agree on a size must set it, or a 10pt footer reserves 12pt lines.
-  applyUniformRunFont(attrs, content);
-  // No run to take the strut from — a zone of blank lines is its style's size all the
-  // same, and nothing else in the band can say how tall those lines are.
-  if (attrs.fontSize == null && styleFontPt != null && !content.some((n) => n.type === 'text')) {
-    attrs.fontSize = `${styleFontPt}pt`;
+  if (isText(last)) {
+    const after = footer ? 0 : bandPt;
+    if (after || margin(paras[paras.length - 1], 'bottom')) last.attrs = { ...last.attrs, spaceAfter: after };
   }
-  if (textAlign) attrs.textAlign = textAlign;
-  if (stops) attrs.tabStops = stops;
-  const bandPt = (bandCm / 2.54) * 72;
-  const before = snapPt((spaceBefore ?? 0) + padTopPt + (footer ? bandPt : 0));
-  const after = snapPt(between + padBottomPt + (footer ? 0 : bandPt));
-  if (before) attrs.spaceBefore = before;
-  if (after) attrs.spaceAfter = after;
-  Object.assign(attrs, box);
-  if (Object.keys(attrs).length) para.attrs = attrs;
-  return { type: 'doc', content: [para] };
-}
-
-// The header/footer schema is a subset of the body's, and it is not forgiving: one node
-// or mark it doesn't know (a hyperlink, a date field) makes the whole zone fail to render
-// and come out blank. Drop what it can't hold, keeping the text.
-let zoneSchema: Schema | null = null;
-function fitZoneSchema(nodes: Node[]): Node[] {
-  zoneSchema ??= getSchema(hfExtensions());
-  const out: Node[] = [];
-  for (const n of nodes) {
-    if (!zoneSchema.nodes[n.type]) {
-      const text = typeof n.attrs?.text === 'string' ? n.attrs.text : '';
-      if (text) out.push({ type: 'text', text });
-      continue;
-    }
-    const marks = n.marks?.filter((m) => zoneSchema!.marks[m.type]);
-    out.push(marks && marks.length !== n.marks?.length ? { ...n, marks } : n);
-  }
-  return out;
-}
-
-// The zone collapses several source paragraphs into one, so pick the box props that
-// reproduce the visible band+rule: background/side rules from the first that declares
-// them, but the bottom rule from the LAST paragraph (it sits under the whole band).
-function mergeHfBox(maps: Record<string, string>[]): Record<string, string> {
-  const out: Record<string, string> = {};
-  const first = (key: string) => maps.find((m) => m[key] !== undefined)?.[key];
-  const last = (key: string) => [...maps].reverse().find((m) => m[key] !== undefined)?.[key];
-  for (const [key, val] of [
-    ['backgroundColor', first('backgroundColor')],
-    ['borderTop', first('borderTop')],
-    ['borderLeft', first('borderLeft')],
-    ['borderRight', first('borderRight')],
-    ['borderBottom', last('borderBottom')],
-  ] as const) {
-    if (val !== undefined) out[key] = val;
-  }
-  return out;
+  return zone;
 }
 
 // The text width of a page setup; the ODF default page where the file declares none.
@@ -1279,7 +1227,7 @@ function convertBlocks(elements: Element[], ctx: Ctx, kind: BlockKind, boldByDef
       }
       // tracked-changes registry, decls, soft-page-break, … → no visual content
     } else if (el.namespaceURI === NS.table && el.localName === 'table') {
-      if (kind === 'body') {
+      if (kind === 'body' || kind === 'zone') {
         // Before the conversion: a section the table opens may have a text width of its
         // own, which is what its columns are measured against.
         const flow = tableSectionFlow(el, ctx);
@@ -1315,9 +1263,8 @@ function convertBlocks(elements: Element[], ctx: Ctx, kind: BlockKind, boldByDef
   return out;
 }
 
-// A <text:table-of-content> → a tableOfContents node. Entries (text + level + page) are
-// parsed from the cached index-body as a starting cache; the node view recomputes page
-// numbers live after mount, so parse fidelity isn't critical.
+// A <text:table-of-content> → a tableOfContents node. Its entries (text + level + page)
+// are the cached index-body, shown as saved until the index is updated.
 const ODF_INDEX_KIND: Record<string, IndexKind | undefined> = {
   'table-of-content': 'toc', 'illustration-index': 'figures', 'table-index': 'tables',
   'alphabetical-index': 'alphabetical', 'bibliography': 'bibliography',
@@ -1344,21 +1291,6 @@ function convertToc(el: Element, ctx: Ctx, indexKind: IndexKind): Node {
   // Before the rest: a section the index opens may have a text width of its own, which
   // is what the entries' tab stop is measured against.
   const flow = indexSectionFlow(el, ctx);
-  const indexBody = el.getElementsByTagNameNS(NS.text, 'index-body')[0];
-  const entries: { text: string; level: number; page: number }[] = [];
-  if (indexBody) {
-    for (const p of Array.from(indexBody.children)) {
-      if (p.namespaceURI !== NS.text || p.localName !== 'p') continue; // skip index-title
-      const style = p.getAttributeNS(NS.text, 'style-name') ?? '';
-      const m = /Contents_20_(\d+)/.exec(style);
-      const level = m ? Math.min(MAX_HEADING_LEVEL, Math.max(1, parseInt(m[1], 10))) : 1;
-      const { text, page } = tocEntryTextAndPage(p);
-      // An alphabetical row's number cell is a list ("3, 7, 12"); the node view rebuilds
-      // it from the marks, so the cache only has to survive until then.
-      const pages = page.split(/[,;]/).map((n) => Math.max(1, parseInt(n, 10) || 1)).filter(Boolean);
-      if (text) entries.push({ text, level, page: pages[0] ?? 1, ...(pages.length > 1 ? { pages } : {}) });
-    }
-  }
   // The file's own heading ("Inhalt", "Sommaire", …), so a reopened index keeps its name.
   // No <text:index-title> means the index really has none — its heading is an ordinary
   // paragraph above it, and adding ours would double it.
@@ -1405,7 +1337,7 @@ function convertToc(el: Element, ctx: Ctx, indexKind: IndexKind): Node {
   // The attr defaults stay implicit, as everywhere else: '.' is the leader a fresh index
   // has, and a null stop is the end of the column. `leader: null` is not the default — it
   // is an index whose rows deliberately have no fill.
-  const attrs: Record<string, unknown> = { entries, title, maxLevel, index: indexKind, ...flow,
+  const attrs: Record<string, unknown> = { entries: null, title, maxLevel, index: indexKind, ...flow,
     ...(leader === '.' ? {} : { leader }), ...(tabPosCm != null ? { tabPosCm } : {}) };
   // A template that names no page number is an index of text alone (Word's TOC \n). A
   // bibliography row never has one, so its own template says nothing about this.
@@ -1427,26 +1359,54 @@ function convertToc(el: Element, ctx: Ctx, indexKind: IndexKind): Node {
       ? 'numbered'
       : styles.find((st) => st && st !== 'key') ?? 'key';
   }
+  const pages = attrs.pageNumbers !== false && indexKind !== 'bibliography';
+  const entries: TocEntry[] = [];
+  const indexBody = el.getElementsByTagNameNS(NS.text, 'index-body')[0];
+  for (const p of Array.from(indexBody?.children ?? [])) {
+    // A bibliography converted from a Word table holds one source per row.
+    if (p.namespaceURI === NS.table && p.localName === 'table') {
+      for (const tr of Array.from(p.getElementsByTagNameNS(NS.table, 'table-row'))) {
+        const text = Array.from(tr.getElementsByTagNameNS(NS.text, 'p'))
+          .map((q) => tocEntryTextAndPage(q, false).text).filter(Boolean).join(' ');
+        if (text) entries.push({ text, level: 1, page: 1 });
+      }
+      continue;
+    }
+    if (p.namespaceURI !== NS.text || p.localName !== 'p') continue; // skip index-title
+    // The rows name automatic styles derived from the level's own (Contents 2, …).
+    const style = p.getAttributeNS(NS.text, 'style-name') ?? '';
+    const levelOf = (name: string | null) => /(?:_20_| )(\d+)$/.exec(name ?? '');
+    const m = levelOf(style) ?? levelOf(ctx.resolver.namedAncestor(style));
+    const level = m ? Math.min(MAX_HEADING_LEVEL, Math.max(1, parseInt(m[1], 10))) : 1;
+    const { text, page } = tocEntryTextAndPage(p, pages);
+    const nums = page.split(/[,;]/).map((n) => parseInt(n, 10)).filter((n) => n > 0);
+    // An alphabetical index's letter rows carry no number and are not entries.
+    if (!text || (indexKind === 'alphabetical' && pages && !nums.length)) continue;
+    entries.push({ text, level, page: nums[0] ?? 1, ...(nums.length > 1 ? { pages: nums } : {}) });
+  }
+  attrs.entries = entries;
   return { type: 'tableOfContents', attrs };
 }
 
-// Split a TOC entry paragraph around its last <text:tab/>: the text before it is the
-// entry text, the run after it is the page number. Tabs contribute no textContent, so
-// partition the text nodes by their document position relative to the tab element.
-function tocEntryTextAndPage(p: Element): { text: string; page: string } {
-  const FOLLOWING = 0x04; // Node.DOCUMENT_POSITION_FOLLOWING (the DOM Node is shadowed here)
+// A cached row: its text up to the last tab (earlier tabs read as spaces), the page
+// number after it — or, for an index without page numbers, the whole row as text.
+function tocEntryTextAndPage(p: Element, pages: boolean): { text: string; page: string } {
   const tabs = p.getElementsByTagNameNS(NS.text, 'tab');
-  const lastTab = tabs.length ? tabs[tabs.length - 1] : null;
+  const lastTab = pages && tabs.length ? tabs[tabs.length - 1] : null;
   let before = '';
   let after = '';
-  const walker = p.ownerDocument.createTreeWalker(p, NodeFilter.SHOW_TEXT);
-  let n: ChildNode | null;
-  while ((n = walker.nextNode() as ChildNode | null)) {
-    const txt = n.nodeValue ?? '';
-    if (lastTab && lastTab.compareDocumentPosition(n) & FOLLOWING) after += txt;
-    else before += txt;
-  }
-  return { text: before.trim(), page: after.trim() };
+  let past = false;
+  const walk = (el: Element) => {
+    for (const c of Array.from(el.childNodes)) {
+      if (c === lastTab) { past = true; continue; }
+      const e = c.nodeType === 1 ? (c as Element) : null;
+      if (e && !(e.namespaceURI === NS.text && (e.localName === 'tab' || e.localName === 's'))) { walk(e); continue; }
+      const txt = e ? ' ' : c.nodeValue ?? '';
+      if (past) after += txt; else before += txt;
+    }
+  };
+  walk(p);
+  return { text: before.replace(/\s+/g, ' ').trim(), page: after.trim() };
 }
 
 // What a block's named style already gives it — the yardstick for "is this direct
@@ -1458,13 +1418,15 @@ type BlockDefaults = {
   indentPt: number;
   // The named style's line spacing as an ODF factor; a block declaring the same one adds
   // nothing, but a block that declares 100% under a 115% style is direct formatting.
-  lineHeight: number;
+  lineHeight: string;
   // The style's own alignment and flow flags (Title centres, Heading keeps with next).
   textAlign: string | null;
   keepNext: boolean;
   keepLines: boolean;
   boldByDefault: boolean;
   fonts: Set<string>;
+  // The asian fonts the block already renders its CJK text in.
+  asianFonts: Set<string>;
   color: string;
   // Marks the style already provides. A run that opts *out* of one can't be expressed
   // (only bold has fontWeight:'normal'), so it keeps the style's rendering.
@@ -1474,23 +1436,13 @@ type BlockDefaults = {
   underline: string | null;
   strike: string | null;
   caps: CapsMode | null;
-  // The language in force for the block's runs — its own, else the document's.
+  // The languages in force for the block's runs — its own, else the document's.
   lang: string | null;
+  langAsian: string | null;
   // The style's own paragraph background and rule lines (paraBoxAttrs).
   box: Record<string, string>;
 };
 
-// fo:language(+fo:country) as one tag; null where the style declares none. The asian slot
-// is read only where there is no western one: LibreOffice gives every document an asian
-// default (zh-CN) whatever it is written in, so preferring it would call every German file
-// Chinese. A file that names *only* the asian slot — ours does for an East Asian language
-// — is the one that means it.
-function langTagOfProps(props: PropMap): string | null {
-  const l = props['fo:language'];
-  if (l && l !== 'none') return tagFromOdf(l, props['fo:country']);
-  const a = props['style:language-asian'];
-  return a && a !== 'none' ? tagFromOdf(a, props['style:country-asian']) : null;
-}
 
 // Metric twins: the on-screen font and the name we declare in files mean the same thing.
 const FONT_TWINS: Record<string, string[]> = {
@@ -1500,11 +1452,27 @@ const FONT_TWINS: Record<string, string[]> = {
   'liberation sans': ['arial'],
 };
 
-// fo:line-height as a factor; null for a length or `normal`, which is not a percentage.
-function linePercent(lh: string | undefined): number | null {
-  if (!lh || !lh.endsWith('%')) return null;
-  const p = parseFloat(lh);
-  return Number.isFinite(p) ? Math.round(p) / 100 : null;
+// The set plus the family and its metric twin, lower-cased as the sets compare.
+function withFont(set: Set<string>, family: string | null | undefined): Set<string> {
+  const out = new Set(set);
+  const f = family?.toLowerCase();
+  if (f) {
+    out.add(f);
+    for (const twin of FONT_TWINS[f] ?? []) out.add(twin);
+  }
+  return out;
+}
+
+// fo:line-height as the model spells it: a factor ('1.5') for a percentage, a fixed
+// height ('28pt') for a length; null for `normal` or anything unreadable.
+function lineSpacing(lh: string | undefined): string | null {
+  if (!lh || lh === 'normal') return null;
+  if (lh.endsWith('%')) {
+    const p = parseFloat(lh);
+    return Number.isFinite(p) ? String(Math.round(p) / 100) : null;
+  }
+  const pt = lengthToPt(lh);
+  return pt != null && pt > 0 ? `${snapPt(pt)}pt` : null;
 }
 
 // fo:text-align → the editor's four values (start/end read as an LTR page), or null.
@@ -1518,13 +1486,13 @@ function odfTextAlign(ta: string | undefined): string | null {
 function blockDefaults(resolver: StyleResolver, named: string | null, headingLevel: number | null, boldByDefault: boolean): BlockDefaults {
   const hdef = headingLevel != null ? HEADING_DEFAULTS[headingLevel - 1] : null;
   const doc = resolver.documentLanguage();
-  const docLang = doc ? tagFromOdf(doc.language, doc.country) : null;
+  const docLang = doc.main;
   const fallback: BlockDefaults = {
     fontSizePt: hdef ? hdef.fontSizePt : BODY_FONT_SIZE_PT,
     marginTopPt: hdef ? hdef.marginTopPt : 0,
     marginBottomPt: hdef ? hdef.marginBottomPt : 0,
     indentPt: 0,
-    lineHeight: 1,
+    lineHeight: '1',
     textAlign: null,
     keepNext: false,
     keepLines: false,
@@ -1532,42 +1500,44 @@ function blockDefaults(resolver: StyleResolver, named: string | null, headingLev
     // file that declares its own heading style re-parents it, so bold is formatting.
     boldByDefault: (headingLevel != null && !resolver.styleParent(named)) || boldByDefault,
     fonts: new Set(headingLevel != null ? DEFAULT_HEADING_FONTS : DEFAULT_FONTS),
+    // The file's default asian font, and an East Asian document's Han default besides.
+    asianFonts: withFont(withFont(DEFAULT_FONTS, resolver.asianFontOf(resolver.paraTextProps(null))), docLang && cjkDocFont(docLang)),
     color: '#000000',
     italic: hdef ? hdef.italic : false,
     underline: null,
     strike: null,
     caps: null,
-    lang: docLang,
+    lang: doc.west,
+    langAsian: doc.asian,
     box: {},
   };
   if (!named) return fallback;
   const para = resolver.paraProps(named);
   const text = resolver.paraTextProps(named);
-  const family = resolver.fontFamilyOf(text)?.toLowerCase();
-  const fonts = new Set(fallback.fonts);
-  if (family) {
-    fonts.add(family);
-    for (const twin of FONT_TWINS[family] ?? []) fonts.add(twin);
-  }
+  const fonts = withFont(fallback.fonts, resolver.fontFamilyOf(text));
+  const asianFonts = withFont(fallback.asianFonts, resolver.asianFontOf(text));
   const weight = text['fo:font-weight'];
   const fontStyle = text['fo:font-style'];
+  const langs = langTagsOfProps(text);
   return {
     fontSizePt: lengthToPt(text['fo:font-size']) ?? fallback.fontSizePt,
     marginTopPt: lengthToPt(para['fo:margin-top']) ?? 0,
     marginBottomPt: lengthToPt(para['fo:margin-bottom']) ?? 0,
     indentPt: lengthToPt(para['fo:margin-left']) ?? 0,
-    lineHeight: linePercent(para['fo:line-height']) ?? 1,
+    lineHeight: lineSpacing(para['fo:line-height']) ?? '1',
     textAlign: odfTextAlign(para['fo:text-align']),
     keepNext: para['fo:keep-with-next'] === 'always',
     keepLines: para['fo:keep-together'] === 'always',
     boldByDefault: weight ? weight === 'bold' || parseInt(weight, 10) >= 600 : fallback.boldByDefault,
     fonts,
+    asianFonts,
     color: (text['fo:color'] && normalizeColor(text['fo:color'])) || fallback.color,
     italic: fontStyle === 'italic' || fontStyle === 'oblique',
     underline: lineSig(text, 'underline'),
     strike: lineSig(text, 'line-through'),
     caps: capsFromOdf(text),
-    lang: langTagOfProps(text) ?? docLang,
+    lang: langs.west ?? doc.west,
+    langAsian: langs.asian ?? doc.asian,
     box: paraBoxAttrs(para),
   };
 }
@@ -1602,13 +1572,10 @@ function paraPropsFromOdf(props: PropMap): ParaProps {
   if (mt != null) out.spaceBefore = snapPt(mt);
   if (mb != null) out.spaceAfter = snapPt(mb);
   if (ml != null) out.indent = Math.round(ml * 100) / 100;
-  // The ODF percentage itself, as everywhere else in the model (blockAttrs, both DOCX
-  // paths, and the export, which writes it straight back out as a percentage).
-  const lh = props['fo:line-height'];
-  if (lh && lh.endsWith('%')) {
-    const mult = parseFloat(lh) / 100;
-    if (Number.isFinite(mult)) out.lineHeight = String(Math.round(mult * 100) / 100);
-  }
+  // The ODF percentage itself, or a fixed height, as everywhere else in the model
+  // (blockAttrs, both DOCX paths, and the export, which writes either straight back).
+  const lh = lineSpacing(props['fo:line-height']);
+  if (lh) out.lineHeight = lh;
   const bg = props['fo:background-color'];
   if (bg && bg !== 'transparent') out.backgroundColor = normalizeColor(bg) ?? undefined;
   let pad: number | null = null;
@@ -1629,6 +1596,8 @@ function textPropsFromOdf(props: PropMap, resolver: StyleResolver): TextProps {
   // Our own export declares the metric twin; keep the registry on the on-screen name
   // so an export→import loop doesn't drift.
   if (family) out.fontFamily = screenFontName(family);
+  const asian = resolver.asianFontOf(props);
+  if (asian) out.fontFamilyAsian = screenFontName(asian);
   const size = lengthToPt(props['fo:font-size']);
   if (size != null) out.fontSizePt = Math.round(size * 10) / 10;
   const spacing = lengthToPt(props['fo:letter-spacing']);
@@ -1659,6 +1628,16 @@ function ownProps<T extends object>(resolved: T, parent: T): T {
     if (resolved[key] !== undefined && resolved[key] !== parent[key]) out[key] = resolved[key];
   }
   return out;
+}
+
+// The default style's asian font is a default where it is the western one (a file that
+// names a single font) or an East Asian document's Han default — both what an export
+// writes back unasked.
+export function dropDefaultAsianFont(text: TextProps, docTag: string | null | undefined): void {
+  const cjk = docTag ? cjkDocFont(docTag) : null;
+  if (text.fontFamilyAsian && (text.fontFamilyAsian === (text.fontFamily ?? 'Liberation Serif') || text.fontFamilyAsian === cjk)) {
+    delete text.fontFamilyAsian;
+  }
 }
 
 // The document's style registry: the editor's built-ins, with the file's own definitions
@@ -1694,6 +1673,9 @@ function collectStyleSheet(resolver: StyleResolver, ctx: Ctx): StyleSheet {
     };
     const level = /^Heading (\d+)$/.exec(name);
     if (level) style.outlineLevel = Number(level[1]);
+    if (name === DEFAULT_STYLE) {
+      dropDefaultAsianFont(style.text, resolver.documentLanguage().main);
+    }
     sheet.paragraph[name] = style;
   }
   // A chapter number's character style is named by the outline definition, not by any
@@ -1729,8 +1711,8 @@ function outlineFromOdf(el: Element | null, ctx: Ctx): OutlineNumbering | null {
   for (let level = 1; level <= MAX_OUTLINE_LEVELS; level++) {
     const def = Array.from(el.children).find(
       (c) => c.localName === 'outline-level-style' && c.getAttributeNS(NS.text, 'level') === String(level));
-    const format = def?.getAttributeNS(NS.style, 'num-format') ?? '';
-    if (!def || !['1', 'a', 'A', 'i', 'I'].includes(format)) {
+    const format = def ? knownNumFormat(def.getAttributeNS(NS.style, 'num-format')) : null;
+    if (!def || !format) {
       out.push({ ...DEFAULT_OUTLINE_LEVEL });
       continue;
     }
@@ -1740,7 +1722,7 @@ function outlineFromOdf(el: Element | null, ctx: Ctx): OutlineNumbering | null {
     const labelText = charStyle ? textPropsFromOdf(ctx.resolver.spanTextProps(charStyle), ctx.resolver) : null;
     const geometry = outlineLevelGeometry(def);
     out.push({
-      format: format as NoteNumFormat,
+      format,
       prefix: def.getAttributeNS(NS.style, 'num-prefix') ?? '',
       suffix: (def.getAttributeNS(NS.style, 'num-suffix') ?? '') + geometry.pad,
       displayLevels: Math.max(1, parseInt(def.getAttributeNS(NS.text, 'display-levels') ?? '1', 10) || 1),
@@ -1822,12 +1804,8 @@ function listStyleFromOdf(name: string, el: Element, builtin?: boolean): ListSty
 // The block's yardstick plus what the run's character style provides.
 function charDefaults(ctx: Ctx, base: BlockDefaults, odfName: string): BlockDefaults {
   const props = ctx.resolver.spanTextProps(odfName);
-  const family = ctx.resolver.fontFamilyOf(props)?.toLowerCase();
-  const fonts = new Set(base.fonts);
-  if (family) {
-    fonts.add(family);
-    for (const twin of FONT_TWINS[family] ?? []) fonts.add(twin);
-  }
+  const fonts = withFont(base.fonts, ctx.resolver.fontFamilyOf(props));
+  const asianFonts = withFont(base.asianFonts, ctx.resolver.asianFontOf(props));
   const weight = props['fo:font-weight'];
   const fontStyle = props['fo:font-style'];
   return {
@@ -1835,6 +1813,7 @@ function charDefaults(ctx: Ctx, base: BlockDefaults, odfName: string): BlockDefa
     fontSizePt: lengthToPt(props['fo:font-size']) ?? base.fontSizePt,
     boldByDefault: weight ? weight === 'bold' || parseInt(weight, 10) >= 600 : base.boldByDefault,
     fonts,
+    asianFonts,
     color: (props['fo:color'] && normalizeColor(props['fo:color'])) || base.color,
     italic: fontStyle ? fontStyle === 'italic' || fontStyle === 'oblique' : base.italic,
     underline: props['style:text-underline-style'] ? lineSig(props, 'underline') : base.underline,
@@ -1866,7 +1845,9 @@ function convertParaLike(el: Element, ctx: Ctx, kind: BlockKind, boldByDefault =
   // box — the formatting has to become direct, so it is measured against the default
   // style instead: the one `p:not([data-style])` re-applies (styleSheet.ts). A heading
   // keeps its level's yardstick, which is what `hN:not([data-style])` re-applies.
-  const yardstick = kind === 'body' ? named : isHeading ? null : DEFAULT_STYLE;
+  // A header/footer zone renders its paragraphs at the editor's own defaults with only the
+  // default style's font on top, so that is what its formatting is measured against.
+  const yardstick = kind === 'body' ? named : isHeading || kind === 'zone' ? null : DEFAULT_STYLE;
   const defaults = blockDefaults(resolver, yardstick, isHeading ? level : null, boldByDefault);
   // A cell paragraph's spacing is the exception: editor.css zeroes it whatever the default
   // style declares (only that rule outranks the style's — not the `li p` one, and not for a
@@ -1877,14 +1858,14 @@ function convertParaLike(el: Element, ctx: Ctx, kind: BlockKind, boldByDefault =
   // its own header/footer; the block that does it opens that section, and from it on
   // the blocks measure against that master's text width.
   const master = kind === 'body' ? resolver.masterPageOf(styleName) : null;
-  const opensSection = !!master && master !== (ctx.masterPages[ctx.masterPages.length - 1] ?? ctx.leadingMaster);
+  const opensSection = !!master && opensMaster(master, ctx);
   if (opensSection) {
     ctx.masterPages.push(master!);
     // The same paragraph carries the number the section restarts at, if it does.
     const restart = Number(paraProps['style:page-number']);
     ctx.masterPageStarts.push(Number.isFinite(restart) ? clampPageStart(restart) : null);
     const geo = resolver.pageGeometry(master!);
-    if (geo) ctx.contentWidthCm = contentWidthOf(geo);
+    if (geo) { ctx.contentWidthCm = contentWidthOf(geo); ctx.leftMarginCm = geo.margins.left; }
   }
   const attrs = blockAttrs(paraProps, baseTextProps, defaults, kind);
   if (paraProps['style:contextual-spacing'] === 'true') applyContextualSpacing(el, styleName, attrs);
@@ -1906,15 +1887,17 @@ function convertParaLike(el: Element, ctx: Ctx, kind: BlockKind, boldByDefault =
   const markSizePt = lengthToPt(baseTextProps['fo:font-size']);
   // The block's own language, which its runs are measured against; the document's is
   // the default and no formatting.
-  const docLang = defaults.lang;
-  const blockLang = langTagOfProps(baseTextProps) ?? docLang;
+  const ownLangs = langTagsOfProps(baseTextProps);
+  const blockLang = ownLangs.west ?? defaults.lang;
+  const blockLangAsian = ownLangs.asian ?? defaults.langAsian;
   const runDefaults = {
     ...(markSizePt != null && Math.abs(markSizePt - defaults.fontSizePt) > 0.05
       ? { ...defaults, fontSizePt: markSizePt }
       : defaults),
     lang: blockLang,
+    langAsian: blockLangAsian,
   };
-  const content = convertInline(el, ctx, baseTextProps, runDefaults, false);
+  const content = convertInline(el, ctx, baseTextProps, runDefaults);
 
   // The paragraph style's own font size is the block's line-height floor on every
   // line, not only on an empty one; carry it as a block attr (mirrors the docx
@@ -1924,6 +1907,8 @@ function convertParaLike(el: Element, ctx: Ctx, kind: BlockKind, boldByDefault =
   // Keep with next: a heading does that anyway (pageBreaks.ts), and what the block's
   // own style supplies (Title keeps with next) is not direct formatting either.
   if (!isHeading && !defaults.keepNext && paraProps['fo:keep-with-next'] === 'always') attrs.keepNext = true;
+  // Unless a heading style the file defines drops it; an undefined one is the built-in.
+  if (isHeading && paraProps['fo:keep-with-next'] !== 'always' && resolver.namedAncestor(styleName)) attrs.keepNext = false;
   if (!isHeading && !defaults.keepLines && paraProps['fo:keep-together'] === 'always') attrs.keepLines = true;
   // "Don't hyphenate this paragraph" — only meaningful where the document hyphenates at
   // all; below that switch it is the default and no formatting.
@@ -1933,10 +1918,22 @@ function convertParaLike(el: Element, ctx: Ctx, kind: BlockKind, boldByDefault =
   const wm = paraProps['style:writing-mode'];
   if (wm === 'rl-tb' && !ctx.pageRtl) attrs.dir = 'rtl';
   else if (wm === 'lr-tb' && ctx.pageRtl) attrs.dir = 'ltr';
-  if (blockLang && blockLang !== docLang) attrs.lang = blockLang;
+  if (blockLang && blockLang !== defaults.lang) attrs.lang = blockLang;
+  if (blockLangAsian && blockLangAsian !== defaults.langAsian) attrs.langAsian = blockLangAsian;
   const markFont = resolver.fontFamilyOf(baseTextProps);
   if (markFont && !defaults.fonts.has(markFont.toLowerCase())) attrs.fontFamily = markFont;
+  const markAsian = resolver.asianFontOf(baseTextProps);
+  if (markAsian && !defaults.asianFonts.has(markAsian.toLowerCase())) attrs.fontFamilyAsian = markAsian;
+  // Outside the body the named style's font is baked in rather than declared, so runs
+  // that all agree on another one still make it the block's, as they do in the body.
+  const styleText = kind !== 'body' && named ? resolver.paraTextProps(named) : null;
+  const baked = {
+    fontSize: styleText && styleText['fo:font-size'] === baseTextProps['fo:font-size'] ? attrs.fontSize : undefined,
+    fontFamily: styleText && resolver.fontFamilyOf(styleText) === markFont ? attrs.fontFamily : undefined,
+  };
+  for (const [k, v] of Object.entries(baked)) if (v != null) delete attrs[k];
   applyUniformRunFont(attrs, content);
+  for (const [k, v] of Object.entries(baked)) if (v != null && attrs[k] == null) attrs[k] = v;
   sinkOffsetFrames(content);
 
   const node: Node = { type: isHeading ? 'heading' : 'paragraph' };
@@ -1966,23 +1963,12 @@ function blockAttrs(paraProps: PropMap, textProps: PropMap, defaults: BlockDefau
   const base = paraProps['style:writing-mode'] === 'rl-tb' ? 'right' : defaults.textAlign ?? 'left';
   if (ta !== null && ta !== base) attrs.textAlign = ta;
 
-  const lh = paraProps['fo:line-height'];
-  if (lh && lh !== 'normal') {
-    let mult: number | null = null;
-    if (lh.endsWith('%')) {
-      const p = parseFloat(lh);
-      if (Number.isFinite(p)) mult = p / 100;
-    } else {
-      // Fixed line height: best-effort multiplier against the resolved font size.
-      const pt = lengthToPt(lh);
-      const fontPt = lengthToPt(textProps['fo:font-size']) ?? defaults.fontSizePt;
-      if (pt != null && fontPt > 0) mult = pt / (fontPt * LINE_HEIGHT_RATIO);
-    }
-    if (mult != null) {
-      mult = Math.round(mult * 100) / 100;
-      if (Math.abs(mult - defaults.lineHeight) > 0.01) attrs.lineHeight = String(mult);
-    }
-  }
+  // A header/footer's proportional spacing is left out: LibreOffice lays the band out at
+  // single height (measured: a 10pt header in a 115% style reserves one plain line).
+  const lh = lineSpacing(paraProps['fo:line-height']);
+  const widened = kind === 'zone' && lh != null && !lh.endsWith('pt') && Number(lh) > 1;
+  if (lh != null && lh !== defaults.lineHeight && !widened) attrs.lineHeight = lh;
+  if (paraProps['style:snap-to-layout-grid'] === 'false') attrs.snapToGrid = false;
 
   const defTop = defaults.marginTopPt;
   const defBottom = defaults.marginBottomPt;
@@ -1998,13 +1984,21 @@ function blockAttrs(paraProps: PropMap, textProps: PropMap, defaults: BlockDefau
   // list-style level properties, not paraProps. What the style already indents is not
   // direct formatting.
   if (kind !== 'list') {
+    // LibreOffice's font-relative loext: twins (in `ic`, characters) win over the fo: ones.
+    const ic = (v: string | undefined) => { const m = /^(-?[\d.]+)ic$/.exec(v ?? ''); return m ? parseFloat(m[1]) : 0; };
     const ml = lengthToPt(paraProps['fo:margin-left']) ?? 0;
-    if (Math.abs(ml - defaults.indentPt) > EPS_PT) attrs.indent = Math.round((ml / 72) * 2.54 * 100) / 100;
+    const leftChars = ic(paraProps['loext:margin-left']);
+    if (leftChars > 0) attrs.indentChars = leftChars;
+    else if (Math.abs(ml - defaults.indentPt) > EPS_PT) attrs.indent = Math.round((ml / 72) * 2.54 * 100) / 100;
     // fo:text-indent is the first line only; negative is a hanging indent.
+    const chars = ic(paraProps['loext:text-indent']);
     const ti = lengthToCm(paraProps['fo:text-indent']);
-    if (ti != null && Math.abs(ti) > 0.02) attrs.indentFirst = Math.round(ti * 100) / 100;
+    if (chars) attrs.indentFirstChars = chars;
+    else if (ti != null && Math.abs(ti) > 0.02) attrs.indentFirst = Math.round(ti * 100) / 100;
     const mr = lengthToCm(paraProps['fo:margin-right']);
-    if (mr != null && mr > 0.02) attrs.indentRight = Math.round(mr * 100) / 100;
+    const rightChars = ic(paraProps['loext:margin-right']);
+    if (rightChars > 0) attrs.indentRightChars = rightChars;
+    else if (mr != null && mr > 0.02) attrs.indentRight = Math.round(mr * 100) / 100;
   }
 
   // Manual page break (fo:break-before); the editor has no column breaks, so only
@@ -2256,7 +2250,7 @@ function noteBodyStyle(e: Element, ctx: Ctx, kind: NoteKind): string | null {
 
 // <text:note> → the anchor node, with the note's own text collected into ctx for the
 // section the document end gets. A body of several paragraphs is flattened to hard
-// breaks — the editor's note holds one paragraph, as convertHfZone does for a zone.
+// breaks — the editor's note holds one paragraph.
 function convertNote(e: Element, ctx: Ctx, defaults: BlockDefaults): Node | null {
   const kind: NoteKind = e.getAttributeNS(NS.text, 'note-class') === 'endnote' ? 'endnote' : 'footnote';
   const citation = e.getElementsByTagNameNS(NS.text, 'note-citation')[0] ?? null;
@@ -2288,7 +2282,7 @@ function numberStyleKind(tokens: Token[]): 'date' | 'time' | null {
 
 // ---- inline conversion --------------------------------------------------------
 
-function convertInline(root: Element, ctx: Ctx, baseProps: PropMap, defaults: BlockDefaults, hfFields = false): Node[] {
+function convertInline(root: Element, ctx: Ctx, baseProps: PropMap, defaults: BlockDefaults): Node[] {
   const out: Node[] = [];
   // Point comments, with the run index they were seen at — resolved after the walk.
   const points: { at: number; attrs: Record<string, unknown> }[] = [];
@@ -2316,17 +2310,15 @@ function convertInline(root: Element, ctx: Ctx, baseProps: PropMap, defaults: Bl
     }
     if (linkHref) marks.push({ type: 'link', attrs: { href: linkHref } });
     // Ranges overlap, so the run carries every bookmark it is in — plus any point
-    // bookmark waiting for it. The one-paragraph header/footer schema has no mark.
-    if (!hfFields) {
-      for (const name of ctx.openBookmarks.keys()) ctx.openBookmarks.set(name, true);
-      for (const name of new Set([...ctx.openBookmarks.keys(), ...ctx.pointBookmarks])) {
-        marks.push({ type: 'bookmark', attrs: { name } });
-      }
-      ctx.pointBookmarks.clear();
+    // bookmark waiting for it.
+    for (const name of ctx.openBookmarks.keys()) ctx.openBookmarks.set(name, true);
+    for (const name of new Set([...ctx.openBookmarks.keys(), ...ctx.pointBookmarks])) {
+      marks.push({ type: 'bookmark', attrs: { name } });
     }
-    const comment = hfFields ? undefined : ctx.openComments.values().next().value;
+    ctx.pointBookmarks.clear();
+    const comment = ctx.openComments.values().next().value;
     if (comment) marks.push({ type: 'comment', attrs: comment });
-    const insertion = hfFields ? undefined : ctx.openInsertions.values().next().value;
+    const insertion = ctx.openInsertions.values().next().value;
     if (insertion) marks.push({ type: 'insertion', attrs: insertion });
     if (extra) marks.push(extra);
     const node: Node = { type: 'text', text: clean };
@@ -2387,6 +2379,8 @@ function convertInline(root: Element, ctx: Ctx, baseProps: PropMap, defaults: Bl
             continue;
           }
           case 'note': {
+            // The zone schema has no notes.
+            if (ctx.zone) continue;
             const note = convertNote(e, ctx, defaults);
             if (note) out.push(note);
             continue;
@@ -2416,9 +2410,9 @@ function convertInline(root: Element, ctx: Ctx, baseProps: PropMap, defaults: Bl
             const name = e.getAttributeNS(NS.text, 'ref-name');
             const fmt = e.getAttributeNS(NS.text, 'reference-format');
             // A format the editor cannot recompute (chapter, a user variable) keeps the
-            // value the file cached, and so does a reference in a header or footer.
+            // value the file cached.
             const kind = e.localName === 'sequence-ref' ? 'sequence' : e.localName === 'note-ref' ? 'note' : 'bookmark';
-            if (!hfFields && name && isCrossRefFormat(fmt)) {
+            if (name && isCrossRefFormat(fmt)) {
               const field: Node = {
                 type: 'crossRef',
                 attrs: { name, format: fmt, text: e.textContent ?? '', ...(kind === 'bookmark' ? {} : { kind }) },
@@ -2445,10 +2439,11 @@ function convertInline(root: Element, ctx: Ctx, baseProps: PropMap, defaults: Bl
             continue;
           case 'change-start':
           case 'change-end': {
-            // A recorded insertion brackets its runs; the registry holds who and when.
+            // A recorded insertion brackets its runs; the registry holds who and when. The
+            // zone schema records no revisions.
             const id = e.getAttributeNS(NS.text, 'change-id');
             const rev = id ? ctx.revisions.get(id) : undefined;
-            if (!hfFields && id && rev?.kind === 'insertion') {
+            if (!ctx.zone && id && rev?.kind === 'insertion') {
               if (e.localName === 'change-start') ctx.openInsertions.set(id, { id, author: rev.author, date: rev.date });
               else ctx.openInsertions.delete(id);
             }
@@ -2460,7 +2455,7 @@ function convertInline(root: Element, ctx: Ctx, baseProps: PropMap, defaults: Bl
             // are real styled runs, so they convert like any inline content.
             const id = e.getAttributeNS(NS.text, 'change-id');
             const rev = id ? ctx.revisions.get(id) : undefined;
-            if (!hfFields && id && rev?.kind === 'deletion' && (rev.paras.length || rev.text)) {
+            if (!ctx.zone && id && rev?.kind === 'deletion' && (rev.paras.length || rev.text)) {
               const del = { type: 'deletion', attrs: { id, author: rev.author, date: rev.date } };
               if (!rev.paras.length) {
                 out.push({ type: 'text', text: rev.text, marks: [...marksFor(props, ctx.resolver, defaults), del] });
@@ -2479,7 +2474,7 @@ function convertInline(root: Element, ctx: Ctx, baseProps: PropMap, defaults: Bl
           default:
             // In headers/footers, page fields stay live fields (pageField.ts). The atom
             // carries the run's marks so its digits render in the run's font/size.
-            if (hfFields && (e.localName === 'page-number' || e.localName === 'page-count')) {
+            if (ctx.zone && (e.localName === 'page-number' || e.localName === 'page-count')) {
               const field: Node = { type: e.localName === 'page-count' ? 'pageCount' : 'pageNumber' };
               const marks = marksFor(props, ctx.resolver, defaults);
               if (marks.length) field.marks = marks;
@@ -2488,7 +2483,7 @@ function convertInline(root: Element, ctx: Ctx, baseProps: PropMap, defaults: Bl
             }
             // The running head's chapter name; text:display="number"/"plain-number" is a
             // numbering we don't track, so those keep the file's cached string.
-            if (hfFields && e.localName === 'chapter' && e.getAttributeNS(NS.text, 'display') === 'name') {
+            if (ctx.zone && e.localName === 'chapter' && e.getAttributeNS(NS.text, 'display') === 'name') {
               const level = Number(e.getAttributeNS(NS.text, 'outline-level')) || 1;
               const field: Node = { type: 'chapterField', attrs: { level, text: e.textContent ?? '' } };
               const marks = marksFor(props, ctx.resolver, defaults);
@@ -2514,7 +2509,7 @@ function convertInline(root: Element, ctx: Ctx, baseProps: PropMap, defaults: Bl
             }
             // A placeholder field (Insert ▸ Field ▸ Placeholder): the label is the
             // shown text without the <>/‹› brackets either producer draws around it.
-            if (!hfFields && e.localName === 'placeholder') {
+            if (e.localName === 'placeholder') {
               const label = (e.textContent ?? '').trim().replace(/^[<‹]/, '').replace(/[>›]$/, '');
               const field: Node = { type: 'placeholderField', attrs: { text: label } };
               const marks = marksFor(props, ctx.resolver, defaults);
@@ -2526,7 +2521,7 @@ function convertInline(root: Element, ctx: Ctx, baseProps: PropMap, defaults: Bl
             // A caption's running number (caption.ts). Only the two categories the
             // editor counts survive as a live field; any other sequence (a user
             // variable, a chapter counter) keeps its evaluated text.
-            if (!hfFields && e.localName === 'sequence') {
+            if (e.localName === 'sequence') {
               const field = convertSequenceField(e);
               const refName = e.getAttributeNS(NS.text, 'ref-name');
               const anchor: Mark | undefined = refName && ctx.seqRefNames.has(refName)
@@ -2550,17 +2545,17 @@ function convertInline(root: Element, ctx: Ctx, baseProps: PropMap, defaults: Bl
             // A place marked for the alphabetical index. LibreOffice writes a point
             // mark; a range one (-mark-start/-end) is kept at its start, the editor's
             // entry being a place too.
-            if (!hfFields && (e.localName === 'alphabetical-index-mark' || e.localName === 'alphabetical-index-mark-start')) {
+            if (e.localName === 'alphabetical-index-mark' || e.localName === 'alphabetical-index-mark-start') {
               const term = e.getAttributeNS(NS.text, 'string-value') ?? '';
               if (term.trim()) {
                 out.push({ type: 'indexEntry', attrs: { term: term.trim(), key1: (e.getAttributeNS(NS.text, 'key1') ?? '').trim() } });
               }
               continue;
             }
-            if (!hfFields && e.localName === 'alphabetical-index-mark-end') continue;
+            if (e.localName === 'alphabetical-index-mark-end') continue;
             // A citation. Every field is an attribute of the mark, so the source record
             // travels with it; the element's text is what the citation showed.
-            if (!hfFields && e.localName === 'bibliography-mark') {
+            if (e.localName === 'bibliography-mark') {
               const entry = bibEntryFromMark(e);
               if (entry) { out.push(entry); continue; }
             }
@@ -2579,26 +2574,12 @@ function convertInline(root: Element, ctx: Ctx, baseProps: PropMap, defaults: Bl
           if (marks.length) field.marks = marks;
           out.push(field);
         } else {
-          for (const n of convertInline(e, ctx, props, defaults, hfFields)) out.push(n);
+          for (const n of convertInline(e, ctx, props, defaults)) out.push(n);
         }
         continue;
       }
       if (e.namespaceURI === NS.draw) {
         const conv = convertDrawElement(e, ctx);
-        // The one-paragraph zone flows as-char images; a positioned frame is out of
-        // flow — the page-anchored letterhead or watermark a title page is made of —
-        // and keeps its wrap plus its position from the page corner. Boxes are dropped.
-        if (hfFields) {
-          const img = conv?.inline?.type === 'image' ? conv.inline : null;
-          const wrap = img?.attrs?.wrap;
-          if (img && (!wrap || wrap === 'inline')) {
-            out.push({ ...img, attrs: { ...img.attrs, wrap: 'inline' } });
-          } else if (img) {
-            const at = (a: string) => Math.max(0, lengthToCm(e.getAttributeNS(NS.svg, a)) ?? 0);
-            out.push({ ...img, attrs: { ...img.attrs, wrapOffset: at('x'), wrapOffsetY: at('y') } });
-          } else if (conv) ctx.warnings.add('Drawings were removed');
-          continue;
-        }
         // A box is inline like a picture, so it stays exactly where the frame sits.
         if (conv?.inline) out.push(conv.inline);
         else if (conv?.block) out.push(conv.block);
@@ -2608,7 +2589,7 @@ function convertInline(root: Element, ctx: Ctx, baseProps: PropMap, defaults: Bl
         // A ranged comment brackets its text with a named annotation/annotation-end pair;
         // a point one (LibreOffice's comment with nothing selected) carries no name and
         // sits after the text it was made on. The zone schema has no comment mark.
-        if (hfFields) continue;
+        if (ctx.zone) continue;
         if (e.localName === 'annotation-end') {
           const name = e.getAttributeNS(NS.office, 'name');
           if (name) ctx.openComments.delete(name);
@@ -2727,10 +2708,6 @@ function capsFromOdf(props: PropMap): CapsMode | null {
 // leaves them at the defaults sets Hebrew at 12pt Times, not the 16pt the style declares.
 const COMPLEX_SCRIPT_RE = /[֐-ࣿऀ-෿฀-๿ក-៿יִ-﷿ﹰ-ﻼ]/;
 
-// CJK punctuation and the fullwidth forms are script Common, so the property escapes
-// miss them; LibreOffice sets both from the asian properties.
-export const ASIAN_SCRIPT_RE =
-  /[\p{sc=Han}\p{sc=Hiragana}\p{sc=Katakana}\p{sc=Hangul}\p{sc=Bopomofo}\u3000-\u303f\uff00-\uffef]/u;
 
 // The three property sets differ only by suffix; the western one has none.
 const SCRIPT_ALIASES = [
@@ -2742,19 +2719,21 @@ const SCRIPT_ALIASES = [
 ] as const;
 
 // Fold the set belonging to the text's script onto the western keys marksFor reads. The
-// choice is per text node, so a node mixing Latin and CJK takes the asian font
-// throughout; both formats write a span boundary where the script changes.
+// choice is per text node; both formats write a span boundary where the script changes.
+// The asian font is not folded: a run keeps the pair, and the editor sets each character
+// from the font of its script.
 function scriptProps(text: string, props: PropMap): PropMap {
   const suffix = COMPLEX_SCRIPT_RE.test(text) ? '-complex'
     : ASIAN_SCRIPT_RE.test(text) ? '-asian' : '';
   if (!suffix) return props;
   const out = { ...props };
+  const folded = suffix === '-asian' ? SCRIPT_ALIASES.slice(0, 3) : SCRIPT_ALIASES;
   // The two font forms shadow each other, as everywhere else (layerTextProps).
-  if (props[`style:font-family${suffix}`] || props[`style:font-name${suffix}`]) {
+  if (suffix === '-complex' && (props['style:font-family-complex'] || props['style:font-name-complex'])) {
     delete out['fo:font-family'];
     delete out['style:font-name'];
   }
-  for (const [western, stem] of SCRIPT_ALIASES) {
+  for (const [western, stem] of folded) {
     const value = props[`${stem}${suffix}`];
     if (value) out[western] = value;
   }
@@ -2804,9 +2783,12 @@ function marksFor(props: PropMap, resolver: StyleResolver, defaults: BlockDefaul
 
   const caps = capsFromOdf(props);
   if (caps && caps !== defaults.caps) textStyle.caps = caps;
+  const em = props['style:text-emphasize'];
+  if (isEmphasis(em)) textStyle.emphasis = em;
 
-  const lang = langTagOfProps(props);
-  if (lang && lang !== defaults.lang) textStyle.lang = lang;
+  const langs = langTagsOfProps(props);
+  if (langs.west && langs.west !== defaults.lang) textStyle.lang = langs.west;
+  if (langs.asian && langs.asian !== defaults.langAsian) textStyle.langAsian = langs.asian;
 
   const bg = props['fo:background-color'];
   if (bg && bg !== 'transparent') {
@@ -2823,6 +2805,8 @@ function marksFor(props: PropMap, resolver: StyleResolver, defaults: BlockDefaul
 
   const family = resolver.fontFamilyOf(props);
   if (family && !defaults.fonts.has(family.toLowerCase())) textStyle.fontFamily = family;
+  const asian = resolver.asianFontOf(props);
+  if (asian && !defaults.asianFonts.has(asian.toLowerCase())) textStyle.fontFamilyAsian = asian;
 
   if (Object.keys(textStyle).length) marks.push({ type: 'textStyle', attrs: textStyle });
   return marks;
@@ -2967,6 +2951,7 @@ function convertList(el: Element, ctx: Ctx, inheritedStyleName: string | null, d
       if (bulletChar) attrs.bulletChar = bulletChar;
       if (indent != null) attrs.indent = indent;
       if (listLevelRightAligned(levelDef)) attrs.markerAlign = 'right';
+      Object.assign(attrs, listLevelLabel(levelDef, depth));
     }
     const node: Node = { type: 'bulletList', content: items };
     if (Object.keys(attrs).length) node.attrs = attrs;
@@ -2992,6 +2977,7 @@ function convertList(el: Element, ctx: Ctx, inheritedStyleName: string | null, d
     if (listStyleType) attrs.listStyleType = listStyleType;
     if (indent != null) attrs.indent = indent;
     if (listLevelRightAligned(levelDef)) attrs.markerAlign = 'right';
+    Object.assign(attrs, listLevelLabel(levelDef, depth));
   }
   const node: Node = { type: 'orderedList', content: items };
   if (Object.keys(attrs).length) node.attrs = attrs;
@@ -3007,6 +2993,21 @@ function listLevelRightAligned(levelDef: Element | null): boolean {
     return align === 'end' || align === 'right';
   }
   return false;
+}
+
+// The label's hang (the negated fo:text-indent) and what follows it, where they differ
+// from the flat 0.635cm and tab the editor draws. odf-kit writes depth × 0.635cm, which
+// is the same default.
+function listLevelLabel(levelDef: Element | null, depth: number): { hanging?: number; markerSuffix?: 'space' | 'nothing' } {
+  const la = levelDef?.getElementsByTagNameNS(NS.style, 'list-level-label-alignment')[0];
+  if (!la) return {};
+  const out: { hanging?: number; markerSuffix?: 'space' | 'nothing' } = {};
+  const ti = lengthToCm(la.getAttributeNS(NS.fo, 'text-indent'));
+  const hang = ti == null ? null : Math.round(-ti * 100) / 100;
+  if (hang != null && ![LIST_HANGING_CM, depth * LIST_HANGING_CM].some((d) => Math.abs(hang - d) <= LIST_INDENT_EPS_CM)) out.hanging = hang;
+  const follow = la.getAttributeNS(NS.text, 'label-followed-by');
+  if (follow === 'space' || follow === 'nothing') out.markerSuffix = follow;
+  return out;
 }
 
 // Level's fo:margin-left (cm) from its <style:list-level-label-alignment> (the
@@ -3105,17 +3106,26 @@ function unbakeRegionColor(nodes: Node[], color: string): void {
   }
 }
 
+// Naming another master opens a section; naming the current one again does only where
+// that restarts something — its first page hands over, or it demands a side (probed:
+// every chapter reopening LibreOffice's Chapter Intro opens headless on a right page).
+function opensMaster(master: string, ctx: Ctx): boolean {
+  const current = ctx.masterPages[ctx.masterPages.length - 1] ?? ctx.leadingMaster;
+  if (master !== current) return true;
+  return ctx.bodyBlocks > 0 && (!!ctx.resolver.masterPageHF(master).restPage || !!ctx.resolver.pageStartSide(master));
+}
+
 // A block whose style names a master page opens a section, exactly as a paragraph style
 // does (convertParaLike): ODF's only per-section header/footer, and naming one is a page
 // break. Mutates ctx, so it runs before the block is converted against the new width.
 function sectionFlowAttrs(master: string | null, breakBefore: boolean, ctx: Ctx): Record<string, unknown> | null {
   const attrs: Record<string, unknown> = {};
   if (breakBefore && ctx.bodyBlocks) attrs.breakBefore = 'page';
-  if (master && master !== (ctx.masterPages[ctx.masterPages.length - 1] ?? ctx.leadingMaster)) {
+  if (master && opensMaster(master, ctx)) {
     ctx.masterPages.push(master);
     ctx.masterPageStarts.push(null);
     const geo = ctx.resolver.pageGeometry(master);
-    if (geo) ctx.contentWidthCm = contentWidthOf(geo);
+    if (geo) { ctx.contentWidthCm = contentWidthOf(geo); ctx.leftMarginCm = geo.margins.left; }
     attrs.sectionBreak = true;
   }
   if (master && ctx.bodyBlocks) attrs.breakBefore = 'page';

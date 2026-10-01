@@ -55,7 +55,8 @@ so the split is invisible there.
 ```
 Ribbon.svelte
 ├─ .ribbon-tabs     File pill · quick access (save, undo, redo) · tabs · contextual tabs
-│                   · spacer · document name · appearance · UI language
+│                   · spacer · command search · document name · appearance · UI language
+│                   one row that scrolls sideways; its menus are pinned fixed
 └─ .ribbon-body     the active tab's groups, a fixed --w-ribbon-h (84px) band
 ```
 
@@ -108,6 +109,7 @@ at every height. A flex row cannot reserve width in part of its height, so it mo
 | File | Role |
 | --- | --- |
 | `Ribbon.svelte` | Shell, tab state, the File menu, which contextual tabs are shown |
+| `CommandSearch.svelte`, `commands.ts` | The search box and its command index; see *Command search* |
 | `RibbonGroup.svelte` | A group: its controls, its visible label, Word's ↘ dialog launcher |
 | `RibbonButton.svelte` | `big` / `small` / `icon`, plus the split button. Hover paints the **icon box**, not the whole button. A big label wraps onto two lines at a 78px cap and its caret rides beside the icon, so a three-word label costs width instead of a third row; a one- or two-word label takes the width it wraps at instead of the cap, and a German compound wider than the cap therefore widens its button rather than painting over the neighbour |
 | `RibbonMenu.svelte` | The dropdown panel; its look is global CSS, since its rows come from a caller's snippet |
@@ -143,6 +145,25 @@ The ribbon surfaces a good deal the engine already carried with nothing to reach
 underline and strikethrough line styles, Find and Replace as buttons, the page break, section
 breaks, absolute left/right indent, the table-of-contents depth and its page numbers, cell
 margins, Save As.
+
+## Command search
+
+Word's search box (Alt+Q) sits in the tab strip after the spacer. `ribbon/commands.ts` is its
+index: an id, the tab it lives on (`null` for the File menu) and a label read from the existing
+catalog keys. A hit switches to that tab, or opens the File menu, and clicks the control marked
+`data-cmd="<id>"` (`RibbonButton`'s `cmd` prop; a reused picker's wrapper carries it, a
+`display: contents` `.rb-cmd` span where it has none). The control therefore stays the only place a
+command is defined, a disabled one stays disabled, and the user sees where it lives.
+
+A menu entry names its opener in `via`: the opener is clicked first, then the entry. A text field or
+select is focused instead of clicked, and a colour split opens its palette through the chevron. The
+gallery's paragraph styles join the index at run time as `style-<name>`. A command shared by the
+picture and shape tabs lists both and runs in whichever is shown.
+
+Matching folds case and diacritics and ranks a label prefix over a word start over a substring. The
+English label always matches too, so "table" works under every UI language. An empty query lists the
+last five commands used (`edentext-recent-commands`). Contextual-tab commands are offered only while
+their tab is shown. `tests/unit/command-search.test.ts` fails when an indexed id has no control.
 
 ## Dialogs
 

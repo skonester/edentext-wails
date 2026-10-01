@@ -84,6 +84,29 @@
   src: url('../assets/fonts/EdenSymbols.woff2') format('woff2');
 }
 
+/* A space at half the font size, what a document balancing single- and double-byte
+   widths sets (storage/balanceSpaces.ts): Liberation Serif's space with a 0.5em advance,
+   so the line keeps its metrics. (SIL Open Font License, as Liberation.) */
+@font-face {
+  font-family: 'EdenText Space';
+  font-style: normal;
+  font-weight: 1 1000;
+  font-display: block;
+  src: url('../assets/fonts/EdenSpace.woff2') format('woff2');
+  unicode-range: U+20;
+}
+
+/* Liberation Serif's quotation marks set full width, as a Chinese face's are: what a run
+   whose western font is one sets them in where that font is missing (westNames). */
+@font-face {
+  font-family: 'EdenText Quotes';
+  font-style: normal;
+  font-weight: 1 1000;
+  font-display: block;
+  src: url('../assets/fonts/EdenQuotes.woff2') format('woff2');
+  unicode-range: U+2018-2019, U+201C-201D;
+}
+
 /* STIX Two Math — a font with an OpenType MATH table is what makes MathML typeset:
    without one Chromium drops ∑ and ϕ entirely and leaves brackets glyph-height next
    to a fraction. Word uses Cambria Math for the same job. (OFL — see
@@ -398,6 +421,8 @@
      inherit the page font size and dwarf the button rows. */
   font-size: 13px;
   color: var(--w-text);
+  /* `anchored` keeps 8px to either window edge; a phone is narrower than a menu. */
+  max-width: calc(100vw - 16px);
 }
 
 .ribbon-menu.right { left: auto; right: 0; }
@@ -419,6 +444,7 @@
   cursor: pointer;
 }
 
+.ribbon-menu button svg { flex-shrink: 0; }
 .ribbon-menu button:hover:not(:disabled) { background: var(--w-hover); }
 .ribbon-menu button:disabled { color: var(--w-text-tertiary); cursor: default; }
 .ribbon-menu button.selected { background: var(--w-active); }
@@ -435,7 +461,8 @@
   width: 14px;
   color: var(--w-accent);
 }
-.ribbon-menu .menu-sub { font-size: 11px; }
+/* Wraps only when the menu hits its max-width; otherwise it sizes to the unwrapped text. */
+.ribbon-menu .menu-sub { font-size: 11px; white-space: normal; text-align: right; }
 
 /* Section label above a run of rows, and the sticky action row below the list. */
 .ribbon-menu .rb-menu-label {
@@ -495,6 +522,9 @@
 /* A picker standing alone in a group is a labelled button, so its own compact
    trigger grows to the big variant's box and icon size. The stroke is pinned to
    the same 1.5px the ribbon's own icons paint at 28px. */
+/* Marks a reused control for the command search without adding a box around it. */
+.rb-cmd { display: contents; }
+
 .rb-captioned {
   display: flex;
   flex-direction: column;
@@ -686,4 +716,23 @@ html, body {
   height: 100%;
   display: flex;
   flex-direction: column;
+}
+
+/* The native arrow ignores padding and hugs the border, so draw an inset chevron. The
+   !important beats the background and padding shorthands the dialogs give their selects. */
+select:not([multiple], [size], .bare) {
+  appearance: none;
+  padding-inline-end: 22px !important;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%238b95a5' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") !important;
+  background-repeat: no-repeat !important;
+  background-position: right 7px center !important;
+}
+
+/* A modal dialog moves by its title (utils/dragWindow.ts). */
+dialog h2 { cursor: move; user-select: none; touch-action: none; }
+
+/* On a phone every dialog's fixed desktop width gives way to the screen's; the
+   dialog itself is capped there already and scrolls when taller. */
+@media (max-width: 600px) {
+  dialog > * { width: auto !important; min-width: 0 !important; max-width: calc(100vw - 2em) !important; }
 }

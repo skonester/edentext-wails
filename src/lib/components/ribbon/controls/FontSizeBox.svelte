@@ -3,9 +3,9 @@
   import Icon from '../Icon.svelte';
   import { anchored, clickOutside, isMenuOpen, showMenu, closeMenu } from '../menu.svelte';
   import { uniformFontSize } from '../../../utils/selectionFormat';
-  import { coversWholeBlock, FONT_SIZES } from '../../../utils/fontSize';
+  import { coversWholeBlock, parseSize, sizeLabel, sizeMenu } from '../../../utils/fontSize';
   import { saveRange, type SavedRange } from '../selection';
-  import { t } from '../../../i18n/i18n.svelte';
+  import { locale, t } from '../../../i18n/i18n.svelte';
 
   let { editor, tick }: { editor: Editor | null; tick: number } = $props();
 
@@ -15,10 +15,11 @@
   let value = $state('');
   let range: SavedRange = null;
 
+  let named = $derived(locale() === 'zh-Hans');
   let current = $derived(tick >= 0 && editor ? uniformFontSize(editor.state) : '');
 
   $effect(() => {
-    if (!focused && !open) value = current ? current.replace('pt', '') : '';
+    if (!focused && !open) value = current ? sizeLabel(current, named) : '';
   });
 
   function openBox() {
@@ -44,10 +45,8 @@
   function onKeydown(e: KeyboardEvent) {
     if (e.key === 'Enter') {
       e.preventDefault();
-      // Imported files carry fractional sizes (producer rounding, relative style
-      // sizes), so keep one decimal rather than snapping to a whole point.
-      const pt = Math.round(parseFloat(value.replace(',', '.')) * 10) / 10;
-      if (!isNaN(pt) && pt >= 1 && pt <= 400) apply(pt);
+      const pt = parseSize(value);
+      if (pt != null) apply(pt);
       else closeMenu();
       (e.currentTarget as HTMLInputElement).blur();
     } else if (e.key === 'Escape') {
@@ -81,8 +80,8 @@
   {#if open}
     <div class="ribbon-menu rb-size-menu" use:anchored role="menu">
       <div class="menu-scroll">
-        {#each FONT_SIZES as s}
-          <button class:selected={current === `${s}pt`} onclick={() => apply(s)}>{s}</button>
+        {#each sizeMenu(named) as [label, s]}
+          <button class:selected={current !== '' && sizeLabel(current, named) === label} onclick={() => apply(s)}>{label}</button>
         {/each}
       </div>
     </div>

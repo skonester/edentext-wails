@@ -2,12 +2,15 @@
 // Tools ▸ Heading Numbering and Word's multilevel list bound to the heading styles.
 // One definition per document, level 1 first (ODF text:outline-style).
 
-import type { NoteNumFormat } from '../storage/noteSettings';
+import type { OrderedTypeDef } from '../utils/orderedListTypes';
 import type { TextProps } from './styleSheet';
+
+// The list formats, CJK ones included: WPS numbers chapters 一、二、三 by default.
+export type OutlineFormat = OrderedTypeDef['numFormat'];
 
 export type OutlineLevel = {
   // 'none' = this level is unnumbered, which is how both products switch a level off.
-  format: NoteNumFormat | 'none';
+  format: OutlineFormat | 'none';
   prefix: string;
   suffix: string;
   // How many levels the label shows: 1 → "2", 3 → "2.1.4" (ODF text:display-levels).
@@ -43,8 +46,12 @@ export function outlineIsEmpty(outline: OutlineNumbering | null | undefined): bo
   return !outline?.some((l) => l.format !== 'none');
 }
 
-const CSS_STYLE: Record<NoteNumFormat, string> = {
+// The CJK counter styles are the ones the lists use (editor.css).
+const CSS_STYLE: Record<OutlineFormat, string> = {
   '1': 'decimal', a: 'lower-alpha', A: 'upper-alpha', i: 'lower-roman', I: 'upper-roman',
+  '一, 二, 三, ...': 'simp-chinese-informal', '壹, 贰, 叁, ...': 'simp-chinese-formal',
+  '甲, 乙, 丙, ...': 'edt-stem', '①, ②, ③, ...': 'edt-circled',
+  'ア, イ, ウ, ...': 'edt-aiueo', 'イ, ロ, ハ, ...': 'edt-iroha',
 };
 
 const COUNTER = (level: number) => `edt-outline-${level}`;
@@ -81,7 +88,7 @@ function labelContent(outline: OutlineNumbering, level: number): string | null {
 // browser's counters are not available. `counts` holds the number in force per level.
 export function outlineLabel(
   outline: OutlineNumbering | null | undefined, level: number, counts: readonly number[],
-  ordinal: (n: number, format: NoteNumFormat) => string,
+  ordinal: (n: number, format: OutlineFormat) => string,
 ): string {
   if (!outline) return '';
   const own = outlineLevelAt(outline, level);

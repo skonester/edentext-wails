@@ -7,7 +7,7 @@ import { Decoration, DecorationSet } from '@tiptap/pm/view';
 import type { EditorView } from '@tiptap/pm/view';
 import { dropCursor } from '@tiptap/pm/dropcursor';
 import { cmToPx } from '../../storage/pageMargins';
-import { readVerticalMargins, placeFromPage } from './pageBreaks';
+import { readVerticalMargins, placeFromPage, placeInColumn, freeDragX, sinkSideFloat } from './pageBreaks';
 
 // Inline, as-character image, or a floating text-wrapped frame (wrap = flow mode);
 // width/height are doc px @96dpi, rotation CW degrees. Export → cm + ODF
@@ -54,24 +54,32 @@ function parseCm(value: string | null): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+// The share of each side a file cuts off the picture (Word's a:srcRect, ODF's fo:clip):
+// the frame shows the rest, scaled to fill it.
+export type Crop = { l: number; t: number; r: number; b: number };
+export function cropOf(v: unknown): Crop | null {
+  const c = v as Crop | null;
+  if (!c || typeof c !== 'object') return null;
+  const ok = [c.l, c.t, c.r, c.b].every((n) => typeof n === 'number' && n >= 0);
+  return ok && c.l + c.r < 0.99 && c.t + c.b < 0.99 && (c.l || c.t || c.r || c.b) ? c : null;
+}
+const parseCrop = (v: string | null): Crop | null => {
+  const [l, t, r, b] = (v ?? '').split(',').map(Number);
+  return cropOf({ l, t, r, b });
+};
+
 export const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
 // The page text width, live from the vars the editor maintains (margins/orientation).
 const COLUMN_WIDTH_CSS =
   'calc(var(--user-page-width) - var(--user-margin-left) - var(--user-margin-right))';
 
-// An as-character image wider than the text column takes a line of its own and leaves an
-// empty one above it. Fitting it to the column is where an image the file sizes to the
-// column lands anyway. Fractional px throughout: whole ones cost a big frame 0.3mm.
+// An as-character image the file sizes to the column can land under a pixel over it once
+// its cm/EMU width is in px: trim the width so the line holds it, keep the height. A truly
+// wider one keeps its size and overhangs the margin, as LibreOffice draws it.
 export function fitInlineImage(attrs: Record<string, unknown>, maxWidthPx: number): void {
   const w = attrs.width;
-  if (typeof w !== 'number' || w <= maxWidthPx) return;
-  // Under a pixel over is our cm arithmetic disagreeing with the rendered column, not an
-  // oversized picture: trim the width so the line still holds it, and keep the height —
-  // LibreOffice lets that much overhang stand and draws the frame at its stated size.
-  if (typeof attrs.height === 'number' && w - maxWidthPx > 1) {
-    attrs.height = framePx(Math.max(1, (attrs.height * maxWidthPx) / w));
-  }
+  if (typeof w !== 'number' || w <= maxWidthPx || w - maxWidthPx > 1) return;
   attrs.width = framePx(maxWidthPx);
 }
 
@@ -109,6 +117,7 @@ export function droppedFrameAttrs(wrap: WrapMode, inFront: boolean): Record<stri
     wrapOffset: null,
     wrapOffsetY: null,
     wrapFromPage: false,
+    wrapFromBody: false,
     anchorPage: null,
     inFront: wrap === 'through' && inFront,
   };
@@ -117,20 +126,41 @@ export function droppedFrameAttrs(wrap: WrapMode, inFront: boolean): Record<stri
 // Word's behind-text / in-front-of-text, ODF run-through: the text runs over or under
 // the frame, so it reserves nothing. Absolute with no offsets keeps the static position
 // it was anchored at; the file's own offsets ride as margins from there.
-export function applyRunThrough(el: HTMLElement, offsetCm: unknown, offsetYCm: unknown, inFront: boolean, fromPage = false): void {
+export function applyRunThrough(el: HTMLElement, offsetCm: unknown, offsetYCm: unknown, inFront: boolean, fromPage = false, fromBody = false): void {
   const px = (cm: unknown) => (typeof cm === 'number' ? Math.round(cmToPx(cm)) : 0);
   el.style.position = 'absolute';
   el.style.margin = `${px(offsetYCm)}px 0 0 ${px(offsetCm)}px`;
   el.style.zIndex = inFront ? '1' : '-1';
+  // Which side of the text it lands on, for the header/footer layer's stacking.
+  if (inFront) el.dataset.inFront = ''; else delete el.dataset.inFront;
+  clearPagePlace(el);
   // A page-placed frame states its corner instead: placeFromPage turns the pair into
-  // the margins that reach it, and pagination re-places it from these same numbers.
-  if (fromPage) { el.dataset.pageX = String(px(offsetCm)); el.dataset.pageY = String(px(offsetYCm)); }
-  else { delete el.dataset.pageX; delete el.dataset.pageY; }
+  // the margins that reach it, and pagination re-places it from these same numbers. A
+  // header/footer zone places it by CSS from the same pair (HeaderFooterLayer).
+  if (fromPage || fromBody) {
+    if (fromBody) el.dataset.fromBody = '';
+    el.dataset.pageX = String(px(offsetCm));
+    el.dataset.pageY = String(px(offsetYCm));
+    el.style.setProperty('--page-x', `${px(offsetCm)}px`);
+    el.style.setProperty('--page-y', `${px(offsetYCm)}px`);
+  } else if (typeof offsetCm === 'number') {
+    el.dataset.columnX = String(px(offsetCm));
+  }
+}
+
+// A frame leaving run-through, or its page, takes no page place along.
+export function clearPagePlace(el: HTMLElement): void {
+  delete el.dataset.fromBody;
+  delete el.dataset.pageX;
+  delete el.dataset.pageY;
+  delete el.dataset.columnX;
+  el.style.removeProperty('--page-x');
+  el.style.removeProperty('--page-y');
 }
 
 // Drag a frame that is out of the flow. Its offsets count from a point the drag cannot
-// move — the anchor's static position, the page's corner — so the pointer delta is
-// simply added to them. `done(null)` reports a click that never moved.
+// move — the column, the page's corner — so the pointer delta is simply added to them
+// (a frame without an x comes with the one it shows, freeDragX). `done(null)` reports a click that never moved.
 export function startFreeMove(
   event: MouseEvent,
   dom: HTMLElement,
@@ -189,10 +219,29 @@ export function inlineVerticalAlign(vAlign: unknown, boxHeightPx: number, offset
   }
 }
 
+// The offset counts from the anchor paragraph's top. Where text or an earlier frame
+// precedes this one (the importers sink frames behind the text: a full-width float pushes
+// every following line under itself) that part is already covered, so the rest is measured.
+export function sinkToOffset(d: HTMLElement, y: unknown): number | null {
+  const p = d.parentElement;
+  if (typeof y !== 'number' || y <= 0 || !p) return null;
+  let gap = Math.round(cmToPx(y));
+  if (d.previousSibling) {
+    d.style.marginTop = '0px';
+    const box = p.getBoundingClientRect();
+    const scale = box.width / p.offsetWidth || 1;
+    gap = clamp(Math.round(cmToPx(y) - (d.getBoundingClientRect().top - box.top) / scale), 6, pageContentHeightPx());
+  }
+  d.style.marginTop = `${gap}px`;
+  return gap;
+}
+
 // The page text height in px, capping how tall an image can be stretched. Read live
-// from the :root vars the editor maintains (orientation/margins change them).
-export function pageContentHeightPx(): number {
+// from the :root vars the editor maintains (orientation/margins change them). A frame in
+// a header or footer may reach over the whole page.
+export function pageContentHeightPx(frame?: Element): number {
   const cs = getComputedStyle(document.documentElement);
+  if (frame?.closest('.hf-zone')) return parseFloat(cs.getPropertyValue('--user-page-height')) || 4000;
   const h =
     parseFloat(cs.getPropertyValue('--user-page-height')) -
     parseFloat(cs.getPropertyValue('--user-margin-top')) -
@@ -251,8 +300,8 @@ export const Image = Node.create({
         renderHTML: () => ({}),
       },
       // How far below its anchor paragraph the frame sits, in cm (Word's positionV
-      // posOffset, ODF svg:y). Drawn as the float's top margin for `topBottom`, where no
-      // text sits beside the frame; a side float would push away lines Word keeps.
+      // posOffset, ODF svg:y). Drawn as the float's top margin; a side float's lines
+      // still run beside that margin (sinkToOffset).
       wrapOffsetY: {
         default: null,
         parseHTML: el => parseCm((el as HTMLElement).getAttribute('data-wrap-offset-y')),
@@ -282,6 +331,11 @@ export const Image = Node.create({
         parseHTML: el => (el as HTMLElement).getAttribute('data-wrap-align') || null,
         renderHTML: () => ({}),
       },
+      crop: {
+        default: null,
+        parseHTML: el => parseCrop((el as HTMLElement).getAttribute('data-crop')),
+        renderHTML: () => ({}),
+      },
       // Where an as-char frame sits against the line (see inlineVerticalAlign).
       // null = its bottom on the baseline, which is LibreOffice's and Word's default.
       vAlign: {
@@ -295,6 +349,13 @@ export const Image = Node.create({
       wrapFromPage: {
         default: false,
         parseHTML: el => (el as HTMLElement).hasAttribute('data-wrap-from-page'),
+        renderHTML: () => ({}),
+      },
+      // Whether wrapOffsetY counts from the top of the page's body text instead (Word's
+      // relativeFrom="margin", ODF's "page-content"): how a header reaches into the body.
+      wrapFromBody: {
+        default: false,
+        parseHTML: el => (el as HTMLElement).hasAttribute('data-wrap-from-body'),
         renderHTML: () => ({}),
       },
       // A page-anchored frame's stacking against text (ODF style:run-through): default
@@ -322,15 +383,19 @@ export const Image = Node.create({
     const offset = node.attrs.wrapOffset as number | null;
     const offsetY = node.attrs.wrapOffsetY as number | null;
     const va = h ? inlineVerticalAlign(node.attrs.vAlign, h, offsetY) : '';
+    const crop = cropOf(node.attrs.crop);
     const style = [
       w ? `width:${w}px` : '',
       h ? `height:${h}px` : '',
       rot ? `transform:rotate(${rot}deg)` : '',
       va ? `vertical-align:${va}` : '',
+      // ponytail: object-view-box is Chromium's; the node view clips with a box instead.
+      crop ? `object-view-box:inset(${crop.t * 100}% ${crop.r * 100}% ${crop.b * 100}% ${crop.l * 100}%)` : '',
     ].filter(Boolean).join(';');
     return ['img', mergeAttributes(HTMLAttributes, {
       ...(style ? { style } : {}),
       ...(rot ? { 'data-rotation': String(rot) } : {}),
+      ...(crop ? { 'data-crop': [crop.l, crop.t, crop.r, crop.b].join(',') } : {}),
       ...(wrap !== 'inline' ? { 'data-wrap': wrap } : {}),
       ...(offset != null ? { 'data-wrap-offset': String(offset) } : {}),
       ...(offsetY != null ? { 'data-wrap-offset-y': String(offsetY) } : {}),
@@ -340,6 +405,7 @@ export const Image = Node.create({
       ...(node.attrs.anchorPage ? { 'data-anchor-page': String(node.attrs.anchorPage) } : {}),
       ...(node.attrs.inFront ? { 'data-in-front': '' } : {}),
       ...(node.attrs.wrapFromPage ? { 'data-wrap-from-page': '' } : {}),
+      ...(node.attrs.wrapFromBody ? { 'data-wrap-from-body': '' } : {}),
     })];
   },
 
@@ -499,6 +565,7 @@ class ImageView {
   private getPos: () => number;
   // Live offsets while a free drag runs (cm), added to the node's own by offX/offY.
   private dragBy: { x: number; y: number } | null = null;
+  private dragX = 0;
 
   constructor(node: PMNode, editor: Editor, getPos: () => number, view: EditorView) {
     this.node = node;
@@ -521,7 +588,11 @@ class ImageView {
     // Dragging an image live re-anchors it to the text position under the cursor so the
     // surrounding text reflows in real time — inline and floating alike.
     this.img.addEventListener('mousedown', e => this.startReposition(e as MouseEvent));
-    this.rotor.appendChild(this.img);
+    const clip = document.createElement('span');
+    clip.className = 'image-crop';
+    clip.appendChild(this.img);
+    this.rotor.appendChild(clip);
+    this.applyCrop();
 
     for (const cfg of HANDLES) {
       const h = document.createElement('span');
@@ -562,10 +633,17 @@ class ImageView {
   private boxWidth(): number { return parseFloat(this.dom.style.width) || this.attrW() || 0; }
   // The frame's offsets, carrying a running drag. Without one the attr passes through
   // as it stands: null means "no offset stated", which places the frame flush.
-  private offX(): unknown { const v = this.node.attrs.wrapOffset; return this.dragBy ? (typeof v === 'number' ? v : 0) + this.dragBy.x : v; }
+  private offX(): unknown { return this.dragBy ? this.dragX + this.dragBy.x : this.node.attrs.wrapOffset; }
   private offY(): unknown { const v = this.node.attrs.wrapOffsetY; return this.dragBy ? (typeof v === 'number' ? v : 0) + this.dragBy.y : v; }
   // A frame out of the flow is placed by those offsets alone, so it is dragged by them.
-  private isFree(): boolean { return this.attrWrap() === 'through' || typeof this.node.attrs.anchorPage === 'number'; }
+  private isFree(): boolean { return this.attrWrap() === 'through' || typeof this.node.attrs.anchorPage === 'number' || this.pastZone(); }
+  // A zone's frame set against the page or its body text is out of the zone's flow: the
+  // layer places it there and moves the body clear of it (HeaderFooterLayer).
+  private pastZone(): boolean {
+    const a = this.node.attrs;
+    return this.attrWrap() !== 'inline' && (a.wrapFromBody === true || a.wrapFromPage === true)
+      && !!(this.view.dom as HTMLElement).closest('.hf-zone');
+  }
 
   // Size the rotor to w×h, rotate it about its centre, and grow the axis-aligned
   // wrapper to the rotated bounding box so the line reserves the right space.
@@ -606,27 +684,37 @@ class ImageView {
     d.style.display = '';
     d.style.clear = '';
     d.style.margin = '';
+    d.style.shapeOutside = '';
+    delete d.dataset.sinkGap;
     d.style.position = '';
     d.style.zIndex = '';
     d.style.top = '';
     d.style.left = '';
     this.rotor.style.top = '';
+    clearPagePlace(d);
     const a = this.node.attrs;
     if (typeof a.anchorPage === 'number' && a.anchorPage > 0) {
       this.applyPageAnchor(a.anchorPage);
       return;
     }
     delete d.dataset.anchorPage;
+    if (wrap !== 'through' && this.pastZone()) {
+      applyRunThrough(d, this.offX(), this.offY(), true, a.wrapFromPage === true, a.wrapFromBody === true);
+      return;
+    }
     if (wrap === 'through') {
-      applyRunThrough(d, this.offX(), this.offY(), a.inFront === true, a.wrapFromPage === true);
+      applyRunThrough(d, this.offX(), this.offY(), a.inFront === true, a.wrapFromPage === true, a.wrapFromBody === true);
       // Deferred like sinkToOffset: the frame has to be laid out before its own page
-      // can be read off the grid.
-      if (a.wrapFromPage) requestAnimationFrame(() => placeFromPage(this.view, d));
+      // can be read off the grid. Its column only needs it in the document, so a frame
+      // already there (a drag, an edit) lands at once instead of a frame late.
+      if (!a.wrapFromPage && !a.wrapFromBody && d.isConnected) placeInColumn(this.view, d);
+      else requestAnimationFrame(() => (a.wrapFromPage || a.wrapFromBody ? placeFromPage : placeInColumn)(this.view, d));
       return;
     }
     if (wrap === 'left' || wrap === 'right') {
       d.style.float = wrap;
       d.style.margin = frameMargins(wrap, a.wrapOffset, this.boxWidth(), null, a.wrapDist);
+      this.sinkToOffset();
     } else if (wrap === 'topBottom' && (a.wrapAlign === 'left' || a.wrapAlign === 'right')) {
       // Sharing its band with the frame set against the other end (the importers only
       // keep wrapAlign for such a pair): each floats to its own side, so both fit.
@@ -667,19 +755,13 @@ class ImageView {
     d.style.top = `${grid.topOf(page) + px(this.offY())}px`;
   }
 
-  // The offset counts from the anchor paragraph's top. Where text precedes the frame
-  // (the importers sink one behind the text — a full-width float pushes every following
-  // line under itself) the lines already cover part of it, so the rest is measured.
+  // A side float's lines run beside the offset as Word keeps them (sinkSideFloat).
   private sinkToOffset(): void {
-    const y = this.node.attrs.wrapOffsetY;
-    const p = this.dom.parentElement;
-    if (typeof y !== 'number' || y <= 0 || !p || !this.dom.previousSibling) return;
-    this.dom.style.marginTop = '0px';
-    const box = p.getBoundingClientRect();
-    const scale = box.width / p.offsetWidth || 1;
-    const above = (this.dom.getBoundingClientRect().top - box.top) / scale;
-    const gap = clamp(Math.round(cmToPx(y) - above), 6, pageContentHeightPx());
-    this.dom.style.marginTop = `${gap}px`;
+    const gap = sinkToOffset(this.dom, this.node.attrs.wrapOffsetY);
+    const wrap = this.attrWrap();
+    if (gap === null || (wrap !== 'left' && wrap !== 'right')) return;
+    this.dom.dataset.sinkGap = String(gap);
+    sinkSideFloat(this.view, this.dom);
   }
 
   // Drag an image to re-anchor it live to the text position under the cursor (text
@@ -764,7 +846,8 @@ class ImageView {
   // wraps around it, so there is no text position to follow. A click that never moved
   // selects it, as it does everywhere else.
   private startFreeDrag(event: MouseEvent): void {
-    startFreeMove(event, this.dom, this.node.attrs, by => { this.dragBy = by; this.applyWrap(); }, offsets => {
+    this.dragX = freeDragX(this.view, this.dom, this.node.attrs.wrapOffset);
+    startFreeMove(event, this.dom, { ...this.node.attrs, wrapOffset: this.dragX }, by => { this.dragBy = by; this.applyWrap(); }, offsets => {
       if (offsets) { this.commit(offsets); return; }
       const pos = this.getPos();
       if (typeof pos === 'number') {
@@ -816,7 +899,7 @@ class ImageView {
     // The wrapper is axis-aligned, so its scaled/unscaled width ratio is the zoom.
     const zoom = this.dom.getBoundingClientRect().width / this.dom.offsetWidth || 1;
     const maxW = this.boxMaxWidth();
-    const maxH = pageContentHeightPx();
+    const maxH = pageContentHeightPx(this.dom);
     const sx = event.clientX;
     const sy = event.clientY;
     const win = this.dom.ownerDocument.defaultView ?? window;
@@ -901,8 +984,23 @@ class ImageView {
     if (this.img.getAttribute('src') !== src) this.img.src = src;
     this.img.alt = (node.attrs.alt as string) ?? '';
     this.applyLayout(this.attrW(), this.attrH(), this.attrRot());
+    this.applyCrop();
     this.applyWrap();
     return true;
+  }
+
+  // The kept part fills the frame: the picture is drawn that much larger and shifted,
+  // and the crop box cuts off the rest (a box, not object-view-box: every engine and
+  // the raster PDF's html2canvas clip an overflow).
+  private applyCrop(): void {
+    const c = cropOf(this.node.attrs.crop);
+    const s = this.img.style;
+    const w = c ? 1 - c.l - c.r : 1, h = c ? 1 - c.t - c.b : 1;
+    s.position = c ? 'relative' : '';
+    s.width = c ? `${100 / w}%` : '';
+    s.height = c ? `${100 / h}%` : '';
+    s.left = c ? `${(-100 * c.l) / w}%` : '';
+    s.top = c ? `${(-100 * c.t) / h}%` : '';
   }
 
   selectNode(): void {

@@ -5,6 +5,8 @@ import type { EditorState } from '@tiptap/pm/state';
 import type { Node as PmNode } from '@tiptap/pm/model';
 import { FORCE_PAGE_RECALC, isSplitPane, pageBreakKey } from './pageBreaks';
 import { PX_PER_CM } from '../../storage/pageMargins';
+import { blockFontSize } from '../../utils/fontSize';
+import { firstLineCm, leftCm, rightCm } from './indent';
 
 // Per-paragraph tab stops. CSS only has the fixed `tab-size` grid, so a tab that
 // resolves to a stop is measured and given the exact advance as an inline margin.
@@ -66,12 +68,12 @@ export function activeTabStops(state: EditorState): BlockRuler | null {
   for (let d = $from.depth; d >= 0; d--) {
     const node = $from.node(d);
     if (!node.isTextblock) continue;
-    const cm = (v: unknown) => (typeof v === 'number' ? v : 0);
+    const pt = parseFloat(blockFontSize(node));
     return {
       stops: parseTabStops(node.attrs.tabStops),
-      indent: cm(node.attrs.indent),
-      indentRight: cm(node.attrs.indentRight),
-      indentFirst: cm(node.attrs.indentFirst),
+      indent: leftCm(node.attrs, pt),
+      indentRight: rightCm(node.attrs, pt),
+      indentFirst: firstLineCm(node.attrs, pt),
     };
   }
   return null;
@@ -99,9 +101,8 @@ function clampStops(stops: TabStop[], widthCm: number): TabStop[] {
 // stops of its own; a hanging indent implies one at the text position.
 function stopsOf(node: PmNode): TabStop[] {
   const stops = parseTabStops(node.attrs.tabStops);
-  const first = typeof node.attrs.indentFirst === 'number' ? node.attrs.indentFirst : 0;
-  if (first < 0) {
-    const indent = typeof node.attrs.indent === 'number' ? node.attrs.indent : 0;
+  if (node.attrs.indentFirst < 0 || node.attrs.indentFirstChars < 0) {
+    const indent = leftCm(node.attrs, parseFloat(blockFontSize(node)));
     stops.push({ pos: indent, align: 'left' });
     stops.sort((a, b) => a.pos - b.pos);
   }
@@ -330,14 +331,13 @@ type ZoneJob = {
   scale: number; originX: number; stops: TabStop[];
 };
 
-// An inactive header/footer zone is generateHTML output no ProseMirror plugin reaches,
+// An inactive header/footer zone is a cloned DOM no ProseMirror plugin reaches,
 // so its tabs are measured straight on the DOM — same rule, left to right, each advance
 // applied before the next is read. Zones go together: a round's reads before its writes.
 export function layOutZoneTabs(zones: HTMLElement[]): void {
   const jobs: ZoneJob[] = [];
-  for (const zone of zones) {
-    const para = zone.querySelector<HTMLElement>('[data-tab-stops]');
-    if (!para || !parseTabStops(para.getAttribute('data-tab-stops')).length) continue;
+  for (const para of zones.flatMap((z) => Array.from(z.querySelectorAll<HTMLElement>('[data-tab-stops]')))) {
+    if (!parseTabStops(para.getAttribute('data-tab-stops')).length) continue;
     const tabs = wrapZoneTabs(para);
     for (const t of tabs) {
       t.className = '';
@@ -514,7 +514,9 @@ export const TabStops = Extension.create({
           },
         },
         view(view) {
-          if (isSplitPane(view)) return {};
+          // A read-only zone source is cloned per page, and its clones lay out their own
+          // tabs (layOutZoneTabs) with the page's field values.
+          if (isSplitPane(view) || !view.editable) return {};
           const calculate = () => {
             rafId = null;
             let layout: TabLayout = { widths: [], breaks: [] };

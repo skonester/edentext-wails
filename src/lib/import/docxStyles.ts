@@ -1,5 +1,5 @@
 import type { TabAlign, TabStop } from '../editor/extensions/tabStops';
-import type { CapsMode } from '../editor/extensions/textEffects';
+import { emphasisFromWord, type CapsMode, type Emphasis } from '../editor/extensions/textEffects';
 import { lengthToPt } from './styleResolver';
 import { boundedInt } from './importLimits';
 
@@ -43,7 +43,9 @@ export type RunProps = {
   underlineColor?: string; // w:u w:color (raw hex)
   doubleStrike?: boolean;  // w:dstrike
   positionPt?: number;     // w:position: pt above the baseline (negative = below)
-  lang?: string;           // w:lang w:val, the run's language tag
+  emphasis?: Emphasis | false; // w:em; false = a run switching the style's off
+  lang?: string;           // w:lang w:val, the run's western language tag
+  langEastAsia?: string;   // w:lang w:eastAsia, its asian one
 };
 
 // A numbering level definition (numbering.xml w:lvl). bulletFont is the level's
@@ -133,6 +135,7 @@ export function parseRunProps(rPr: Element | null | undefined): RunProps {
       }
       case 'dstrike': { const on = toggle(child); p.doubleStrike = on; if (on) p.strike = true; break; }
       case 'caps': case 'smallCaps': readCaps(p, child); break;
+      case 'em': p.emphasis = emphasisFromWord(wVal(child)) ?? false; break;
       case 'position': { const pt = signedHalfPointsPt(wVal(child)); if (pt != null) p.positionPt = pt; break; }
       case 'vertAlign': {
         const v = wVal(child);
@@ -140,11 +143,12 @@ export function parseRunProps(rPr: Element | null | undefined): RunProps {
         break;
       }
       case 'color': { const v = wVal(child); if (v) p.color = v; break; }
-      // w:eastAsia only where there is no w:val: Word gives every run an east-asian
-      // default, so it names the text's own language only when it stands alone.
+      // Each slot on its own, so a nearer level naming one inherits the other.
       case 'lang': {
-        const v = wVal(child) ?? child.getAttributeNS(W, 'eastAsia');
+        const v = wVal(child);
+        const ea = child.getAttributeNS(W, 'eastAsia');
         if (v) p.lang = v;
+        if (ea) p.langEastAsia = ea;
         break;
       }
       case 'sz': { const n = parseInt(wVal(child) ?? '', 10); if (Number.isFinite(n)) p.sizeHalfPt = n; break; }
@@ -493,6 +497,10 @@ export class DocxStyles {
     return this.paragraphContextualSpacing(this.basedOn.get(styleId) ?? null, seen);
   }
 
+  definesParagraphStyle(styleId: string): boolean {
+    return this.paraStyleNames.has(styleId);
+  }
+
   // w:keepNext along the w:basedOn chain — Word's heading styles all carry it.
   paragraphKeepNext(styleId: string | null | undefined, seen = new Set<string>()): boolean {
     if (!styleId || seen.has(styleId)) return false;
@@ -659,9 +667,12 @@ export function readSpacing(sp: Element): ParaSpacing {
     const n = parseInt(v, 10);
     return Number.isFinite(n) ? n : undefined;
   };
+  // A nonzero *Lines count (hundredths of a line) wins over the twips, as in Word; a line
+  // is 12pt, as LibreOffice converts it.
+  const lines = (name: string) => { const n = num(name + 'Lines'); return n ? n * 240 / 100 : num(name); };
   const out: ParaSpacing = {};
-  const before = num('before'); if (before != null) out.before = before;
-  const after = num('after'); if (after != null) out.after = after;
+  const before = lines('before'); if (before != null) out.before = before;
+  const after = lines('after'); if (after != null) out.after = after;
   const line = num('line'); if (line != null) out.line = line;
   const rule = sp.getAttributeNS(W, 'lineRule'); if (rule) out.lineRule = rule;
   return out;

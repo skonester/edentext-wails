@@ -8,8 +8,8 @@ import { Node as PMNode } from '@tiptap/pm/model';
 import { buildOdt } from '../src/lib/export/odt';
 import { MAX_HEADING_LEVEL } from '../src/lib/styles/headings';
 import { importOdt } from '../src/lib/import/odt';
-import { normalize, firstDiff } from './normalize';
-import { hfExtensions } from '../src/lib/editor/extensions/headerFooter';
+import { normalize, firstDiff, unhoist, stripFontHoist } from './normalize';
+import { zoneExtensions } from '../src/lib/editor/extensions';
 import { HEADER_SHADE } from '../src/lib/editor/extensions/tableHeaderRow';
 import { builtinStyleSheet } from '../src/lib/styles/styleSheet';
 import { buildDocx } from '../src/lib/export/docx';
@@ -83,6 +83,8 @@ const fixture: N = {
       T('dotted ', { type: 'underline', attrs: { lineStyle: 'dotted', lineColor: '#FF0000' } }),
       T('twice ', { type: 'underline', attrs: { lineStyle: 'double' } }),
       T('crossed ', { type: 'strike', attrs: { lineStyle: 'double' } }),
+      T('waved ', { type: 'strike', attrs: { lineStyle: 'wavy' } }),
+      T('stressed ', { type: 'textStyle', attrs: { emphasis: 'dot below' } }),
       T('raised', { type: 'textStyle', attrs: { fontSize: '14pt', textPosition: 3 } }),
     ),
     P(null,
@@ -1010,7 +1012,7 @@ describe('Leg 3: header/footer → buildOdt → importOdt', () => {
       firstDiff(normalize(fixture), normalize(hfRes.content)));
 
     // Imported header/footer must be valid in the header/footer editor schema.
-    const hfSchema = getSchema(hfExtensions());
+    const hfSchema = getSchema(zoneExtensions());
     let hfSchemaOk = true;
     for (const z of [hfRes.header, hfRes.footer]) {
       if (!z) continue;
@@ -1043,22 +1045,25 @@ describe('Leg 3a: different first page header/footer → buildOdt → importOdt'
       { type: 'hardBreak' }, { type: 'hardBreak' },
     ] }] };
 
+    // A zone paragraph round-trips as a body one does: a run's font that is the block's
+    // own comes back on the block alone.
+    const zone = (d: N) => stripFontHoist(normalize(unhoist(structuredClone(d))));
     const bytes = await buildOdt(fixture, margins, 'portrait',
       { header, footer, headerFirst, footerFirst, differentFirstPage: true, pageCount: 3 });
     const res = importOdt(bytes);
 
     check('dfp: no warnings', res.warnings.length === 0, res.warnings);
     check('dfp: flag round-trips', res.differentFirstPage === true, res.differentFirstPage);
-    check('dfp: default header round-trips', firstDiff(normalize(header), normalize(res.header)) === null, firstDiff(normalize(header), normalize(res.header)));
-    check('dfp: default footer round-trips', firstDiff(normalize(footer), normalize(res.footer)) === null, firstDiff(normalize(footer), normalize(res.footer)));
-    check('dfp: first-page header round-trips (incl. marks)', firstDiff(normalize(headerFirst), normalize(res.headerFirst)) === null, firstDiff(normalize(headerFirst), normalize(res.headerFirst)));
+    check('dfp: default header round-trips', firstDiff(zone(header), zone(res.header)) === null, firstDiff(zone(header), zone(res.header)));
+    check('dfp: default footer round-trips', firstDiff(zone(footer), zone(res.footer)) === null, firstDiff(zone(footer), zone(res.footer)));
+    check('dfp: first-page header round-trips (incl. marks)', firstDiff(zone(headerFirst), zone(res.headerFirst)) === null, firstDiff(zone(headerFirst), zone(res.headerFirst)));
     check('dfp: first-page footer preserves spacing', res.footerFirst?.content?.[0]?.content?.[0]?.text === 'Stand:   x', res.footerFirst);
     const ffInline = res.footerFirst?.content?.[0]?.content ?? [];
     const ffBreaks = ffInline.filter((n: N) => n.type === 'hardBreak').length;
     check('dfp: first-page footer keeps trailing blank lines', ffBreaks === 2 && ffInline[ffInline.length - 1]?.type === 'hardBreak', ffInline);
 
     // Every variant must be valid in the header/footer editor schema.
-    const hfSchema = getSchema(hfExtensions());
+    const hfSchema = getSchema(zoneExtensions());
     let ok = true;
     for (const z of [res.header, res.footer, res.headerFirst, res.footerFirst]) {
       if (!z) continue;
@@ -1079,7 +1084,7 @@ describe('Leg 3a: different first page header/footer → buildOdt → importOdt'
     const blankRes = importOdt(blankFirst);
     check('dfp: flag survives an empty first-page zone', blankRes.differentFirstPage === true, blankRes.differentFirstPage);
     check('dfp: empty first-page footer stays blank', blankRes.footerFirst === null, blankRes.footerFirst);
-    check('dfp: default footer still present', firstDiff(normalize(footer), normalize(blankRes.footer)) === null, blankRes.footer);
+    check('dfp: default footer still present', firstDiff(zone(footer), zone(blankRes.footer)) === null, blankRes.footer);
   });
 });
 
@@ -1103,7 +1108,7 @@ describe('Leg 3b: inline images in header/footer → buildOdt → importOdt', ()
     check('hf image: first-page header keeps its image', imgs(res.headerFirst).length === 1, res.headerFirst);
 
     // Both zones must remain valid in the header/footer editor schema.
-    const hfSchema = getSchema(hfExtensions());
+    const hfSchema = getSchema(zoneExtensions());
     let ok = true;
     for (const z of [res.footer, res.headerFirst]) { if (!z) continue; try { PMNode.fromJSON(hfSchema, z).check(); } catch { ok = false; } }
     check('hf image: zones valid in hf schema', ok);
@@ -1129,7 +1134,7 @@ describe('Leg 3c: odd/even page header/footer → buildOdt → importOdt', () =>
     check('odd/even: default + first still round-trip',
       firstDiff(normalize(header), normalize(res.header)) === null && firstDiff(normalize(headerFirst), normalize(res.headerFirst)) === null, res.header);
 
-    const hfSchema = getSchema(hfExtensions());
+    const hfSchema = getSchema(zoneExtensions());
     let ok = true;
     for (const z of [res.headerEven, res.footerEven]) { if (!z) continue; try { PMNode.fromJSON(hfSchema, z).check(); } catch { ok = false; } }
     check('odd/even: even zones valid in hf schema', ok);
@@ -3038,5 +3043,67 @@ describe('Leg 38: a language per paragraph and per run (ODT + DOCX)', () => {
     check('no fo:language in content.xml', !content.includes('fo:language'), content.match(/fo:language="[^"]*"/g));
     const xml = strFromU8(unzipSync(await buildDocx(plain, margins, 'portrait', undefined, de))['word/document.xml']);
     check('no w:lang in document.xml', !xml.includes('<w:lang'), xml.match(/<w:lang[^>]*>/g));
+  });
+});
+
+describe('a fixed line spacing', () => {
+  const sheet = builtinStyleSheet();
+  sheet.paragraph['Fixed'] = { name: 'Fixed', parent: 'Standard', next: 'Standard', para: { lineHeight: '20pt' }, text: {} };
+  const doc: N = { type: 'doc', content: [
+    { type: 'paragraph', attrs: { lineHeight: '28pt' }, content: [{ type: 'text', text: 'exact' }] },
+    { type: 'paragraph', attrs: { styleName: 'Fixed' }, content: [{ type: 'text', text: 'styled' }] },
+  ] };
+
+  it('round-trips as a pt height through ODF and DOCX, on a paragraph and on a style', async () => {
+    const odt = importOdt(await buildOdt(doc, margins, 'portrait', undefined, null, 'A4', sheet));
+    const docxBytes = await buildDocx(doc, margins, 'portrait', undefined, null, 'A4', sheet);
+    check('DOCX writes the paragraph as exact', /<w:spacing[^>]*w:line="560"[^>]*w:lineRule="exact"/.test(strFromU8(unzipSync(docxBytes)['word/document.xml'])));
+    const docx = importDocx(docxBytes);
+    for (const [name, res] of [['ODF', odt], ['DOCX', docx]] as const) {
+      const blocks = res.content.content ?? [];
+      check(`${name}: the paragraph keeps 28pt`, blocks[0]?.attrs?.lineHeight === '28pt', blocks[0]?.attrs);
+      check(`${name}: the styled one carries nothing itself`, blocks[1]?.attrs?.lineHeight == null, blocks[1]?.attrs);
+      check(`${name}: the style keeps 20pt`, res.styles.paragraph['Fixed']?.para.lineHeight === '20pt', res.styles.paragraph['Fixed']?.para);
+    }
+  });
+});
+
+describe('the line grid', () => {
+  const grid = { on: true, pitchPt: 15.6 };
+  const off = { type: 'paragraph', attrs: { snapToGrid: false }, content: [{ type: 'text', text: 'off' }] };
+  const doc: N = { type: 'doc', content: [
+    { type: 'paragraph', content: [{ type: 'text', text: 'on' }] },
+    off,
+    { type: 'table', content: [{ type: 'tableRow', content: [{ type: 'tableCell', content: [off] }] }] },
+  ] };
+  const u = undefined;
+
+  it('round-trips with the blocks off it through ODF and DOCX', async () => {
+    const odtBytes = await buildOdt(doc, margins, 'portrait', u, null, 'A4', u, u, u, u, u, u, u, u, u, u, u, u, u, u, grid);
+    const docxBytes = await buildDocx(doc, margins, 'portrait', u, null, 'A4', u, u, u, u, u, u, u, u, u, u, u, u, u, u, grid);
+    check('DOCX writes a lines grid', /<w:docGrid w:type="lines" w:linePitch="312"/.test(strFromU8(unzipSync(docxBytes)['word/document.xml'])));
+    for (const [name, res] of [['ODF', importOdt(odtBytes)], ['DOCX', importDocx(docxBytes)]] as const) {
+      check(`${name}: the grid comes back`, res.lineGrid.on && Math.abs(res.lineGrid.pitchPt - 15.6) < 0.05, res.lineGrid);
+      const paras = (res.content.content ?? []).filter((n) => n.type === 'paragraph');
+      check(`${name}: a block on the grid carries nothing`, paras[0]?.attrs?.snapToGrid == null, paras[0]?.attrs);
+      check(`${name}: a block off it says so`, paras[1]?.attrs?.snapToGrid === false, paras[1]?.attrs);
+      const cell = JSON.stringify((res.content.content ?? []).find((n) => n.type === 'table'));
+      check(`${name}: so does one in a cell`, cell.includes('"snapToGrid":false'), cell.slice(0, 300));
+    }
+    const plain = importDocx(await buildDocx({ type: 'doc', content: [off] } as N));
+    check('no grid unless asked', plain.lineGrid.on === false, plain.lineGrid);
+  });
+});
+
+// ODF collapses a space that opens a paragraph or follows another, across runs too.
+describe('ODT spaces', () => {
+  it('writes every collapsible space as text:s', async () => {
+    const doc = { type: 'doc', content: [
+      { type: 'paragraph', content: [{ type: 'text', text: ' x    y' }] },
+      { type: 'paragraph', content: [{ type: 'text', text: 'a ' }, { type: 'text', text: ' b', marks: [{ type: 'bold' }] }] },
+    ] };
+    const xml = strFromU8(unzipSync(await buildOdt(doc as N))['content.xml']);
+    expect(xml).toContain('<text:s/>x <text:s text:c="3"/>y');
+    expect(xml).toMatch(/a <text:span [^>]*><text:s\/>b/);
   });
 });

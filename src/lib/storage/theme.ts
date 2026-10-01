@@ -13,6 +13,7 @@ const FIELD_SHADING_KEY = 'edentext-field-shading';
 const RULER_KEY = 'edentext-ruler';
 const SPLIT_KEY = 'edentext-split';
 const PAGE_COLUMNS_KEY = 'edentext-page-columns';
+const RECENT_COMMANDS_KEY = 'edentext-recent-commands';
 
 // Pages side by side. Each column is a live view of the whole document, so the
 // count is capped — LibreOffice's own spinner goes further.
@@ -54,6 +55,20 @@ export function saveRibbonCollapsed(collapsed: boolean): void {
     localStorage.setItem(RIBBON_COLLAPSED_KEY, String(collapsed));
 }
 
+// The command search's ids, most recent first.
+export function loadRecentCommands(): string[] {
+    try {
+        const ids = JSON.parse(localStorage.getItem(RECENT_COMMANDS_KEY) ?? '[]');
+        return Array.isArray(ids) ? ids.filter((id) => typeof id === 'string') : [];
+    } catch {
+        return [];
+    }
+}
+
+export function saveRecentCommands(ids: string[]): void {
+    localStorage.setItem(RECENT_COMMANDS_KEY, JSON.stringify(ids));
+}
+
 export function loadFormattingMarks(): boolean {
     return localStorage.getItem(FORMATTING_MARKS_KEY) === 'true';
 }
@@ -71,9 +86,10 @@ export function saveFieldShading(enabled: boolean): void {
     localStorage.setItem(FIELD_SHADING_KEY, String(enabled));
 }
 
-// The ruler is on unless it was switched off.
+// Unset, the ruler is on except on a phone-wide window, where it only costs a row.
 export function loadRuler(): boolean {
-    return localStorage.getItem(RULER_KEY) !== 'false';
+    const v = localStorage.getItem(RULER_KEY);
+    return v === null ? !window.matchMedia('(max-width: 600px)').matches : v === 'true';
 }
 
 export function saveRuler(enabled: boolean): void {

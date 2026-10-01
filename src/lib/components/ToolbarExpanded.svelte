@@ -1,7 +1,8 @@
 <script lang="ts">
   import type { Editor } from '@tiptap/core';
   import { onMount } from 'svelte';
-  import { fontFromLabel, fontLabel, fontMatches } from './ribbon/fontList.svelte';
+  import { fontFromLabel, fontLabel, fontMatches, isAsianFont } from './ribbon/fontList.svelte';
+  import { uniformFont } from '../utils/selectionFormat';
   import ColorPicker from './ColorPicker.svelte';
   import ParagraphBorderPicker from './ParagraphBorderPicker.svelte';
   import TablePicker from './TablePicker.svelte';
@@ -24,13 +25,13 @@
   import type { Orientation } from '../storage/pageOrientation';
   import { pageDimsCm, PAGE_FORMAT_CM, type PageFormat } from '../storage/pageFormat';
   import { DEFAULT_HF_DISTANCES, clampHfDistance, type HfDistances } from '../storage/headerFooter';
-  import { blockFontSize, coversWholeBlock, DEFAULT_FONT_SIZE, FONT_SIZES, type SizedBlock } from '../utils/fontSize';
+  import { blockFontSize, coversWholeBlock, DEFAULT_FONT_SIZE, parseSize, sizeLabel, sizeMenu, type SizedBlock } from '../utils/fontSize';
   import { listContext } from '../editor/extensions/indent';
   import { stepFontSize } from '../editor/extensions/shortcuts';
   import { findColumns, DEFAULT_COLUMN_GAP_CM } from '../editor/extensions/columns';
   import { DEFAULT_PAGE_NUMBERING, PAGE_NUM_FORMATS, clampPageStart, type PageNumbering } from '../storage/pageNumbering';
   import { formatOrdinal } from '../utils/orderedListTypes';
-  import { t } from '../i18n/i18n.svelte';
+  import { locale, t } from '../i18n/i18n.svelte';
   import { shortcutHint, type ShortcutId } from '../editor/shortcuts';
   import { MAX_PAGE_COLUMNS } from '../storage/theme';
 
@@ -52,10 +53,6 @@
     pageColumns = pageColumns >= MAX_PAGE_COLUMNS ? 1 : pageColumns + 1;
     if (pageColumns > 1) splitView = false;
   }
-
-  // Must match the first font in --font-serif in global.css. Bundled as a
-  // webfont so it is always available and matches the exported .odt's font.
-  const DEFAULT_EDITOR_FONT = 'Liberation Serif';
 
   // Always-shown fonts — render in the picker even when detection fails or is blocked.
   const WEB_SAFE_FONTS: readonly string[] = [
@@ -121,25 +118,8 @@
   const bearsMark = (node: { isText: boolean; isInline: boolean; isAtom: boolean; marks: readonly { type: { name: string } }[] }, markName: string): boolean =>
     node.isText || (node.isInline && node.isAtom && node.marks.some(m => m.type.name === markName));
 
-  // Returns the uniform font of the selection, or '' when fonts are mixed.
-  // Plain Text without an explicit mark falls back to DEFAULT_EDITOR_FONT.
-  let currentFont = $derived.by(() => {
-    if (tick < 0 || !editor) return '';
-    const { from, to, empty } = editor.state.selection;
-    if (empty) {
-      const marks = editor.state.storedMarks ?? editor.state.selection.$head.marks();
-      return marks.find(m => m.type.name === 'textStyle')?.attrs.fontFamily ?? DEFAULT_EDITOR_FONT;
-    }
-    let font: string | undefined;
-    let mixed = false;
-    editor.state.doc.nodesBetween(from, to, (node) => {
-      if (mixed || !bearsMark(node, 'textStyle')) return;
-      const f: string = node.marks.find(m => m.type.name === 'textStyle')?.attrs.fontFamily ?? DEFAULT_EDITOR_FONT;
-      if (font === undefined) font = f;
-      else if (font !== f) mixed = true;
-    });
-    return mixed ? '' : (font ?? DEFAULT_EDITOR_FONT);
-  });
+  // The uniform font of the selection, '' when fonts are mixed.
+  let currentFont = $derived(tick >= 0 && editor ? uniformFont(editor.state) : '');
 
   function effectiveSize(node: { isText: boolean; marks: readonly { type: { name: string }; attrs: Record<string, string> }[] }, parent: SizedBlock): string {
     const explicit = node.marks.find(m => m.type.name === 'textStyle')?.attrs.fontSize;
@@ -321,12 +301,13 @@
   let paraShadeOpen = $state(false);
   let sizeInputFocused = $state(false);
   let sizeInputValue = $state('');
+  let namedSizes = $derived(locale() === 'zh-Hans');
   let savedFrom: number | null = null;
   let savedTo: number | null = null;
 
   $effect(() => {
     if (!sizeInputFocused) {
-      sizeInputValue = currentFontSize ? currentFontSize.replace('pt', '') : '';
+      sizeInputValue = currentFontSize ? sizeLabel(currentFontSize, namedSizes) : '';
     }
   });
 
@@ -395,7 +376,8 @@
     const to   = savedTo   ?? editor.state.selection.to;
     savedFrom = null;
     savedTo   = null;
-    editor.chain().focus().setTextSelection({ from, to }).setFontFamily(value).run();
+    const chain = editor.chain().focus().setTextSelection({ from, to });
+    (isAsianFont(value) ? chain.setFontFamilyAsian(value) : chain.setFontFamily(value)).run();
 
     const next = [value, ...recentFonts.filter((f) => f !== value)].slice(0, MAX_RECENT_FONTS);
     recentFonts = next;
@@ -437,10 +419,8 @@
   function onSizeInputKeydown(e: KeyboardEvent) {
     if (e.key === 'Enter') {
       e.preventDefault();
-      // Imported documents carry fractional sizes (producer rounding, relative style
-      // sizes), so keep one decimal instead of snapping the shown value to a whole point.
-      const num = Math.round(parseFloat(sizeInputValue.replace(',', '.')) * 10) / 10;
-      if (!isNaN(num) && num >= 1 && num <= 400) applyFontSize(num);
+      const num = parseSize(sizeInputValue);
+      if (num != null) applyFontSize(num);
       sizeInputFocused = false;
       (e.target as HTMLInputElement).blur();
     } else if (e.key === 'Escape') {
@@ -934,7 +914,7 @@
   let linkInitialUrl = $state('');
 
   function openLinkDialog() {
-    if (!editor || hfActive) return; // body-only; HF has no link mark
+    if (!editor) return;
     linkInitialUrl = (editor.getAttributes('link').href as string) ?? '';
     linkDialogOpen = true;
   }
@@ -978,15 +958,15 @@
   // --- Bookmarks + cross-references (bookmark.ts / crossReference.ts) ---
   let bookmarkOpen = $state(false);
   let crossRefOpen = $state(false);
-  let bmNames = $derived(tick >= 0 && editor && !hfActive ? bookmarkNames(editor.state.doc) : []);
+  let bmNames = $derived(tick >= 0 && editor ? bookmarkNames(editor.state.doc) : []);
   // A reference can point at a heading, a caption or a numbered item too, so the button
   // no longer waits for someone to set a bookmark first.
-  let hasRefs = $derived(tick >= 0 && !!editor && !hfActive && hasRefTargets(editor.state.doc));
+  let hasRefs = $derived(tick >= 0 && !!editor && hasRefTargets(editor.state.doc));
   // A bookmark covers a range, so there has to be one selected.
   let hasSelection = $derived(tick >= 0 && !!editor && !editor.state.selection.empty);
 
   function openBookmarkDialog() {
-    if (!editor || hfActive || !hasSelection) return;
+    if (!editor || !hasSelection) return;
     bookmarkOpen = true;
     crossRefOpen = false;
   }
@@ -1005,7 +985,7 @@
   }
 
   function openCrossRefDialog() {
-    if (!editor || hfActive || !hasRefs) return;
+    if (!editor || !hasRefs) return;
     crossRefOpen = true;
     bookmarkOpen = false;
   }
@@ -1156,7 +1136,6 @@
           onfocus={onSizeInputFocus}
           onkeydown={onSizeInputKeydown}
           onblur={onSizeInputBlur}
-          inputmode="numeric"
           title={t().toolbarExpanded.fontSize}
         />
         <button class="size-chevron" onclick={openSizePicker} tabindex="-1" title={t().toolbarExpanded.fontSizeList}>
@@ -1169,12 +1148,12 @@
         <div class="size-dropdown">
           <div class="menu-scroll">
             <div class="lh-section-label">{t().toolbarExpanded.fontSize}</div>
-            {#each FONT_SIZES as size}
+            {#each sizeMenu(namedSizes) as [label, size]}
               <button
                 class="size-option"
-                class:active={currentFontSize === `${size}pt`}
+                class:active={sizeLabel(currentFontSize, namedSizes) === label}
                 onclick={() => pickSize(size)}
-              >{size}</button>
+              >{label}</button>
             {/each}
           </div>
         </div>
@@ -1688,8 +1667,7 @@
       />
       <button
         onclick={() => editor?.chain().focus().insertTextBox().run()}
-        disabled={!!hfActive}
-        title={hfActive ? t().toolbarExpanded.textBoxNotInHf : t().toolbarExpanded.insertTextBox}
+        title={t().toolbarExpanded.insertTextBox}
         aria-label={t().toolbarExpanded.insertTextBox}
       >
         <svg width="18" height="18" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -1839,8 +1817,7 @@
         <button
           class:active={isLink}
           onclick={openLinkDialog}
-          disabled={!!hfActive}
-          title={hfActive ? t().toolbarExpanded.linkNotInHf : `${t().toolbarExpanded.insertLink} (${shortcutHint('link')})`}
+          title={`${t().toolbarExpanded.insertLink} (${shortcutHint('link')})`}
           aria-label={t().toolbarExpanded.insertLink}
           aria-haspopup="dialog"
           aria-expanded={linkDialogOpen}
@@ -1863,8 +1840,8 @@
       <div class="link-wrap">
         <button
           onclick={openBookmarkDialog}
-          disabled={!!hfActive || !hasSelection}
-          title={hfActive ? t().toolbarExpanded.bookmarkNotInHf : hasSelection ? t().toolbarExpanded.insertBookmark : t().toolbarExpanded.bookmarkNeedsSelection}
+          disabled={!hasSelection}
+          title={hasSelection ? t().toolbarExpanded.insertBookmark : t().toolbarExpanded.bookmarkNeedsSelection}
           aria-label={t().toolbarExpanded.insertBookmark}
           aria-haspopup="dialog"
           aria-expanded={bookmarkOpen}
@@ -1884,8 +1861,8 @@
         />
         <button
           onclick={openCrossRefDialog}
-          disabled={!!hfActive || !hasRefs}
-          title={hfActive ? t().toolbarExpanded.bookmarkNotInHf : hasRefs ? t().toolbarExpanded.insertCrossRef : t().crossRef.none}
+          disabled={!hasRefs}
+          title={hasRefs ? t().toolbarExpanded.insertCrossRef : t().crossRef.none}
           aria-label={t().toolbarExpanded.insertCrossRef}
           aria-haspopup="dialog"
           aria-expanded={crossRefOpen}

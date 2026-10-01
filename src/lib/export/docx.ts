@@ -5,29 +5,30 @@ import {
   Table, TableRow, TableCell, Header, Footer, PageNumber, SimpleField, ImportedXmlComponent,
   CommentRangeStart, CommentRangeEnd, CommentReference, InsertedTextRun, DeletedTextRun,
   AlignmentType, LevelFormat, LevelSuffix, UnderlineType, BorderStyle, ShadingType,
-  WidthType, HeightRule, PageOrientation, LineRuleType, LineNumberRestartFormat, TableLayoutType, SectionType, NumberFormat,
+  WidthType, HeightRule, PageOrientation, LineRuleType, LineNumberRestartFormat, DocumentGridType, TableLayoutType, SectionType, NumberFormat,
   HorizontalPositionAlign, VerticalPositionRelativeFrom, HorizontalPositionRelativeFrom,
   TableAnchorType, RelativeHorizontalPosition,
   TextWrappingType, TextWrappingSide, TabStopType, LeaderType,
 } from 'docx';
 import type { TiptapNode } from 'odf-kit';
 import type {
-  IRunStylePropertiesOptions, ISpacingProperties, IIndentAttributesProperties,
+  IRunStylePropertiesOptions, IFontAttributesProperties, ISpacingProperties, IIndentAttributesProperties,
   ILevelsOptions, IFloating, IBorderOptions, IParagraphStyleOptions, ICharacterStyleOptions,
   ITableFloatOptions,
 } from 'docx';
 import { unzipSync, zipSync, strFromU8, strToU8 } from 'fflate';
 import { isSvgDataUrl, svgToPngDataUrl } from '../import/imageFormats';
 import { TEXTBOX_PADDING_CM, type TextVAlign } from '../editor/extensions/textBox';
+import { cropOf, type Crop } from '../editor/extensions/image';
 import { SHAPES, isShapeKind, isLineKind, drawingMlPath, type ShapeKind } from '../utils/shapes';
 import { cellFormatCode, isCellFormat } from '../utils/cellFormat';
-import { isAsianTag } from '../storage/documentLanguage';
+import { cjkDocFont, isAsianTag, type ExportLanguage } from '../storage/documentLanguage';
 import { DEFAULT_MARGINS, type PageMargins } from '../storage/pageMargins';
 import type { Orientation } from '../storage/pageOrientation';
 import { pageDimsCm, PAGE_FORMAT_CM, type PageFormat } from '../storage/pageFormat';
 import { DEFAULT_TAB_INTERVAL_CM } from '../storage/tabInterval';
 import type { SpacingModel } from '../storage/spacingModel';
-import { HF_DISTANCE_CM, hfIsEmpty, type HfDoc, type HfSet } from '../storage/headerFooter';
+import { HF_DISTANCE_CM, HF_ZONE_KEYS, hfIsEmpty, type HfDoc, type HfSet } from '../storage/headerFooter';
 import { DEFAULT_NOTE_SETTINGS, type NoteKind, type NoteNumFormat, type NoteSettings } from '../storage/noteSettings';
 import { DOCX_SEQ_NAME, seqCategoryOf } from '../editor/extensions/caption';
 import { sanitizeBookmarkName } from '../editor/extensions/bookmark';
@@ -39,6 +40,8 @@ import { HEADER_SHADE } from '../editor/extensions/tableHeaderRow';
 import { parseBorderAttr, type BorderSide } from '../editor/extensions/tableCellBorders';
 import { parseCellPadding, DEFAULT_CELL_PADDING } from '../editor/extensions/tableCellPadding';
 import { parseTabStops, type TabAlign } from '../editor/extensions/tabStops';
+import { emphasisToWord, isEmphasis } from '../editor/extensions/textEffects';
+import { firstLineCm, leftCm, rightCm } from '../editor/extensions/indent';
 import { charStyleProps, listMarkerFormat } from '../editor/extensions/listMarker';
 import { effectiveOrderedDefAt, formatOrdinal, childCycle, orderedTypeDef, ROOT_ORDERED_CYCLE, type OrderedCycle } from '../utils/orderedListTypes';
 import { effectiveListLevel, listStyleMarginCm, listStyleOverridden, type ListStyle as ListStyleDef } from '../styles/listStyles';
@@ -51,6 +54,7 @@ import { DEFAULT_PAGE_NUMBERING, type PageNumbering } from '../storage/pageNumbe
 import { EMPTY_PAGE_DECOR, isEmptyPageDecor, type PageDecor, type Watermark } from '../storage/pageDecor';
 import { FOLD_MARK_MM, PUNCH_MARK_MM, MARK_START_MM, FOLD_MARK_LEN_MM, PUNCH_MARK_LEN_MM, FOLD_MARK_NAME } from '../storage/foldMarks';
 import { DEFAULT_LINE_NUMBERING, type LineNumbering } from '../storage/lineNumbering';
+import { DEFAULT_LINE_GRID, type LineGrid } from '../storage/lineGrid';
 
 // The five page-number formats both word processors offer → Word's own names.
 const DOCX_PAGE_NUM_FORMAT = {
@@ -83,21 +87,29 @@ type Writable<T> = { -readonly [P in keyof T]: T[P] };
 const SCREEN_FONT = 'Liberation Serif';
 const DOC_FONT = 'Times New Roman';
 
-// The font Word falls back to for Han text when a run names none — the document default
-// only, not a per-run western/asian pair.
-const CJK_DOC_FONT: Record<string, string> = { TW: 'PMingLiU', HK: 'PMingLiU', MO: 'PMingLiU' };
-const CJK_DOC_FONT_DEFAULT = 'SimSun';
+
+// A font pair as w:rFonts: the western font in the slots Word sets Latin and complex text
+// from, the asian one in w:eastAsia. A slot left out inherits, as the pair does on screen.
+function fontPair(west: unknown, asian: unknown, map: (f: string) => string): IFontAttributesProperties | undefined {
+  const w = typeof west === 'string' && west ? map(west) : undefined;
+  const a = typeof asian === 'string' && asian ? map(asian) : undefined;
+  return w || a ? { ascii: w, hAnsi: w, cs: w, eastAsia: a } : undefined;
+}
+const screenToDoc = (f: string) => (f === SCREEN_FONT ? DOC_FONT : f);
 
 // Word keeps three languages per run; Chinese, Japanese and Korean text is read from the
-// east-asian one alone, so a tag that names such a language goes there and w:val stays
-// free for the Latin words among it.
-function langProp(tag: string): { value?: string; eastAsia?: string } {
-  return isAsianTag(tag) ? { eastAsia: tag } : { value: tag };
+// east-asian one alone, so each tag goes to the slot of its script and w:val stays free
+// for the Latin words among it. A later tag wins its slot: the run's over the block's.
+function langProp(...tags: unknown[]): { value?: string; eastAsia?: string } | undefined {
+  const out: { value?: string; eastAsia?: string } = {};
+  for (const tag of tags) if (typeof tag === 'string' && tag) out[isAsianTag(tag) ? 'eastAsia' : 'value'] = tag;
+  return out.value || out.eastAsia ? out : undefined;
 }
 
-function langXml(tag: string): string {
-  const slot = isAsianTag(tag) ? 'w:eastAsia' : 'w:val';
-  return `<w:lang ${slot}="${escapeXml(tag)}"/>`;
+function langXml(...tags: unknown[]): string {
+  const p = langProp(...tags);
+  if (!p) return '';
+  return `<w:lang${p.value ? ` w:val="${escapeXml(p.value)}"` : ''}${p.eastAsia ? ` w:eastAsia="${escapeXml(p.eastAsia)}"` : ''}/>`;
 }
 
 // Effective bullet glyph of a list node: its bulletChar attr, else its named list
@@ -128,6 +140,11 @@ function subtreeHasStart(node: TiptapNode): boolean {
 // List geometry: 0.5in left step per level, 0.25in hanging for the marker (Word defaults).
 const LIST_LEFT_STEP_CM = 1.27;
 const LIST_HANGING_CM = 0.635;
+// A list's hang as Word splits it by sign: a negative one is a first-line indent.
+function listHangIndent(hangingCm: number | null): { hanging?: number; firstLine?: number } {
+  const cm = hangingCm ?? LIST_HANGING_CM;
+  return cm < 0 ? { firstLine: cmToTwip(-cm) } : { hanging: cmToTwip(cm) };
+}
 
 // ODF num-format char → Word numbering format.
 const ORDERED_FORMAT: Record<string, (typeof LevelFormat)[keyof typeof LevelFormat]> = {
@@ -142,6 +159,8 @@ const ORDERED_FORMAT: Record<string, (typeof LevelFormat)[keyof typeof LevelForm
   '壹, 贰, 叁, ...': LevelFormat.CHINESE_LEGAL_SIMPLIFIED,
   '甲, 乙, 丙, ...': LevelFormat.IDEOGRAPH_TRADITIONAL,
   '①, ②, ③, ...': LevelFormat.DECIMAL_ENCLOSED_CIRCLE,
+  'ア, イ, ウ, ...': LevelFormat.AIUEO_FULL_WIDTH,
+  'イ, ロ, ハ, ...': LevelFormat.IROHA_FULL_WIDTH,
 };
 
 // ---- unit conversions ------------------------------------------------------
@@ -185,6 +204,9 @@ let docFormulas: FormulaDocx[] = [];
 type RubyDocx = { base: string; text: string };
 let docRubies: RubyDocx[] = [];
 let docPlaceholders: string[] = [];
+// Every list instance a header or footer uses (zoneLists): the package writes
+// numbering.xml before its header parts, so their instances are registered ahead.
+let docZoneLists: { reference: string; instance: number }[] | null = null;
 
 // The sources cited, one per tag in document order — Word keeps them in a custom-XML
 // part and the CITATION fields only name the tag. Module-level like docFormulas.
@@ -266,6 +288,19 @@ const TXBX_NUM = '';
 // Marks a paragraph whose w:pPr must gain <w:suppressAutoHyphens/> — the docx package
 // has no option for it, so a post-pack pass writes it and drops this run.
 const NOHYP = '';
+// Marks a paragraph off the page's line grid: <w:snapToGrid w:val="0"/>, the same way.
+const NOSNAP = '\uE023';
+// Wraps the w:ind character attributes the docx package lacks (leftChars, rightChars, …),
+// which the same pass adds to the paragraph's w:ind.
+const INDC = '\uE025';
+
+// Wraps a picture's crop in its name (docPr); the docx package writes an empty
+// <a:srcRect/>, which a post-pack pass fills from it.
+const CROP = '\uE030';
+let docCrops = false;
+const srcRectXml = (c: Crop | null) => c
+  ? `<a:srcRect l="${Math.round(c.l * 100000)}" t="${Math.round(c.t * 100000)}" r="${Math.round(c.r * 100000)}" b="${Math.round(c.b * 100000)}"/>`
+  : '<a:srcRect/>';
 
 const WP_NS = 'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"';
 const A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main';
@@ -443,13 +478,14 @@ class Numbering {
     if (depth === 0 && effOrderedKey(node, style, 0) === 'multilevel') this.mlRefs.add(reference);
     const levels = this.map.get(reference)!;
     if (levels.some((l) => l.level === depth)) return;
-    const indent: IIndentAttributesProperties = {
-      left: cmToTwip((depth + 1) * LIST_LEFT_STEP_CM + extraIndentCm),
-      hanging: cmToTwip(LIST_HANGING_CM),
-    };
     // w:lvlJc: which end of the hanging indent the label is set against.
     const eff = effectiveListLevel(node.attrs ?? {}, node.type === 'orderedList', style, depth + 1);
     const alignment = eff.markerAlign === 'right' ? AlignmentType.RIGHT : AlignmentType.LEFT;
+    const indent: IIndentAttributesProperties = {
+      left: cmToTwip((depth + 1) * LIST_LEFT_STEP_CM + extraIndentCm),
+      ...listHangIndent(eff.hanging),
+    };
+    const suffix = eff.markerSuffix === 'space' ? LevelSuffix.SPACE : eff.markerSuffix === 'nothing' ? LevelSuffix.NOTHING : undefined;
     if (eff.kind === 'number') {
       const attr = eff.listStyleType;
       const chained = this.mlRefs.has(reference) && (depth === 0 || !attr || attr === 'multilevel');
@@ -463,6 +499,7 @@ class Numbering {
         alignment,
         start: typeof node.attrs?.start === 'number' ? node.attrs.start : eff.startAt ?? 1,
         style: { paragraph: { indent }, run: markerRunProps(node) },
+        ...(suffix ? { suffix } : {}),
       });
     } else {
       levels.push({
@@ -473,6 +510,7 @@ class Numbering {
         text: bulletCharOf(node, depth, style),
         alignment,
         style: { paragraph: { indent }, run: markerRunProps(node) },
+        ...(suffix ? { suffix } : {}),
       });
     }
   }
@@ -525,8 +563,8 @@ function runPropsFromMarks(marks: TiptapNode['marks'] = [], force: TextProps = {
 
   // Word reads a run's language from its own w:rPr only, so the paragraph's rides in
   // via `force` — ODF needs none of this, LibreOffice passes the block's on to the runs.
-  const lang = ts?.attrs?.lang ?? force.lang;
-  if (lang) props.language = langProp(String(lang));
+  const language = langProp(force.lang, force.langAsian, ts?.attrs?.lang, ts?.attrs?.langAsian);
+  if (language) props.language = language;
 
   const caps = ts?.attrs?.caps;
   if (caps === 'smallCaps') props.smallCaps = true;
@@ -535,9 +573,11 @@ function runPropsFromMarks(marks: TiptapNode['marks'] = [], force: TextProps = {
   // Half-points, as Word writes them: LibreOffice takes the number and ignores a unit
   // behind it. The library's type wants the unit, the file does not.
   if (typeof pos === 'number' && pos) props.position = String(Math.round(pos * 2)) as `${number}pt`;
+  const em = ts?.attrs?.emphasis;
+  if (isEmphasis(em)) props.emphasisMark = { type: emphasisToWord(em) as 'dot' };
 
-  const ff = ts?.attrs?.fontFamily ?? force.fontFamily;
-  if (ff) props.font = String(ff) === SCREEN_FONT ? DOC_FONT : String(ff);
+  const font = fontPair(ts?.attrs?.fontFamily ?? force.fontFamily, ts?.attrs?.fontFamilyAsian ?? force.fontFamilyAsian, screenToDoc);
+  if (font) props.font = font;
   const fs = ts?.attrs?.fontSize ?? (force.fontSizePt != null ? `${force.fontSizePt}pt` : null);
   if (fs) {
     const hp = fontSizeToHalfPoints(String(fs));
@@ -935,26 +975,29 @@ function paraOffsetEmu(cm: number): number {
 
 // offsetCm places the frame in the text column (Word's posOffset); without one it is
 // flush to its side. offsetYCm is how far below the anchor paragraph it sits.
-function floatingFor(wrap: string, offsetCm: number | null, offsetYCm: number | null, alignH?: string | null, distCm?: number | null, inFront?: boolean, fromPage?: boolean): IFloating | undefined {
+function floatingFor(wrap: string, offsetCm: number | null, offsetYCm: number | null, alignH?: string | null, distCm?: number | null, inFront?: boolean, fromPage?: boolean, fromBody?: boolean): IFloating | undefined {
   if (wrap === 'inline') return undefined;
   // The gap beside the frame, on both sides as Word writes it; none above or below.
   const margins = distCm ? { left: Math.round(distCm * 360000), right: Math.round(distCm * 360000) } : undefined;
   // A page-relative offset counts from the top of the page the anchor lands on and may
   // start above it, so it is written as it stands rather than floored at one twip.
-  const verticalPosition = fromPage
-    ? { relative: VerticalPositionRelativeFrom.PAGE, offset: Math.round((offsetYCm ?? 0) * 360000) }
+  // Against the body text, Word's margin is the same edge.
+  const verticalPosition = fromPage || fromBody
+    ? { relative: fromPage ? VerticalPositionRelativeFrom.PAGE : VerticalPositionRelativeFrom.MARGIN, offset: Math.round((offsetYCm ?? 0) * 360000) }
     : { relative: VerticalPositionRelativeFrom.PARAGRAPH, offset: paraOffsetEmu(offsetYCm ?? 0) };
   if (wrap === 'through') {
     // Word's in-front-of / behind-text: no wrap at all, and behindDoc names which side
     // of the text the frame lands on. It overlaps by definition, so allowOverlap holds.
     // Where it sits across the text column is its own, as it is for a wrapped frame:
-    // a full-width figure behind the text is centred, not flush left.
+    // a full-width figure behind the text is centred, not flush left. One with neither
+    // sits at its anchor character.
     const through = alignH === 'right' ? HorizontalPositionAlign.RIGHT
-      : alignH === 'center' ? HorizontalPositionAlign.CENTER : HorizontalPositionAlign.LEFT;
+      : alignH === 'center' ? HorizontalPositionAlign.CENTER : alignH === 'left' ? HorizontalPositionAlign.LEFT : null;
     return {
       horizontalPosition: offsetCm != null
         ? { relative: HorizontalPositionRelativeFrom.MARGIN, offset: Math.round(offsetCm * 360000) }
-        : { relative: HorizontalPositionRelativeFrom.MARGIN, align: through },
+        : through ? { relative: HorizontalPositionRelativeFrom.MARGIN, align: through }
+          : { relative: HorizontalPositionRelativeFrom.CHARACTER, offset: 0 },
       verticalPosition,
       wrap: { type: TextWrappingType.NONE },
       behindDocument: !inFront,
@@ -1022,12 +1065,16 @@ function imageRun(node: TiptapNode): ImageRun | null {
   const offsetCm = typeof node.attrs?.wrapOffset === 'number' ? node.attrs.wrapOffset : null;
   const offsetYCm = typeof node.attrs?.wrapOffsetY === 'number' ? node.attrs.wrapOffsetY : null;
   const distCm = typeof node.attrs?.wrapDist === 'number' ? node.attrs.wrapDist : null;
+  const alt = typeof node.attrs?.alt === 'string' ? node.attrs.alt : '';
+  const crop = cropOf(node.attrs?.crop);
+  docCrops ||= !!crop;
+  const mark = crop ? `${CROP}${[crop.l, crop.t, crop.r, crop.b].join(',')}${CROP}` : '';
   return new ImageRun({
     type: decoded.type,
     data: decoded.bytes,
-    altText: typeof node.attrs?.alt === 'string' && node.attrs.alt ? { name: node.attrs.alt, title: node.attrs.alt, description: node.attrs.alt } : undefined,
+    altText: alt ? { name: alt + mark, title: alt, description: alt } : mark ? { name: mark } : undefined,
     transformation: { width, height, rotation: rotation || undefined },
-    floating: floatingFor(wrap, offsetCm, offsetYCm, node.attrs?.wrapAlign as string | null, distCm, node.attrs?.inFront === true, node.attrs?.wrapFromPage === true),
+    floating: floatingFor(wrap, offsetCm, offsetYCm, node.attrs?.wrapAlign as string | null, distCm, node.attrs?.inFront === true, node.attrs?.wrapFromPage === true, node.attrs?.wrapFromBody === true),
   });
 }
 
@@ -1044,6 +1091,7 @@ type TextBoxDocx = {
   distCm: number | null;
   alignH: string | null;
   fromPage: boolean;
+  fromBody: boolean;
   inFront: boolean;
   shapeKind: ShapeKind;
   shapePath: string | null;
@@ -1073,6 +1121,7 @@ function textBoxDocxDescriptor(node: TiptapNode): TextBoxDocx {
     distCm: typeof a.wrapDist === 'number' ? a.wrapDist : null,
     alignH: a.wrapAlign === 'center' || a.wrapAlign === 'right' || a.wrapAlign === 'left' ? a.wrapAlign : null,
     fromPage: a.wrapFromPage === true,
+    fromBody: a.wrapFromBody === true,
     inFront: a.inFront === true,
     shapeKind: isShapeKind(a.shapeKind) ? a.shapeKind : 'textbox',
     shapePath: typeof a.shapePath === 'string' && a.shapePath ? a.shapePath : null,
@@ -1094,18 +1143,16 @@ function escapeXml(s: string): string {
 
 // Run properties for the hand-serialized txbxContent, in CT_RPr schema order
 // (rFonts, b, i, strike, color, sz, u, shd, vertAlign). Mirrors runPropsFromMarks.
-function txbxRunPropsXml(marks: TiptapNode['marks'] = [], blockLang?: string): string {
+function txbxRunPropsXml(marks: TiptapNode['marks'] = [], blockLangs: unknown[] = []): string {
   const ts = marks.find((m) => m.type === 'textStyle');
   const parts: string[] = [];
   // w:rStyle leads w:rPr; the run's own properties below still win, as in the body.
   const cs = marks.find((m) => m.type === 'charStyle')?.attrs?.name;
   if (typeof cs === 'string' && cs) parts.push(`<w:rStyle w:val="${escapeXml(docxStyleId(cs))}"/>`);
-  const ff = ts?.attrs?.fontFamily;
-  if (ff) {
-    const f = escapeXml(String(ff) === SCREEN_FONT ? DOC_FONT : String(ff));
-    // All four, as the library writes them for the body: Word sets CJK text from
-    // w:eastAsia alone, and without it the run inherits the document default's.
-    parts.push(`<w:rFonts w:ascii="${f}" w:eastAsia="${f}" w:hAnsi="${f}" w:cs="${f}"/>`);
+  const font = fontPair(ts?.attrs?.fontFamily, ts?.attrs?.fontFamilyAsian, screenToDoc);
+  if (font) {
+    const slots = (['ascii', 'eastAsia', 'hAnsi', 'cs'] as const).filter((k) => font[k]);
+    parts.push(`<w:rFonts${slots.map((k) => ` w:${k}="${escapeXml(font[k]!)}"`).join('')}/>`);
   }
   let bold = markPresent(marks, 'bold');
   const fw = ts?.attrs?.fontWeight;
@@ -1123,6 +1170,7 @@ function txbxRunPropsXml(marks: TiptapNode['marks'] = [], blockLang?: string): s
   else if (caps === 'uppercase') parts.push('<w:caps/>');
   const pos = ts?.attrs?.textPosition;
   if (typeof pos === 'number' && pos) parts.push(`<w:position w:val="${Math.round(pos * 2)}"/>`);
+  if (isEmphasis(ts?.attrs?.emphasis)) parts.push(`<w:em w:val="${emphasisToWord(ts.attrs.emphasis)}"/>`);
   const col = ts?.attrs?.color;
   if (col) {
     const h = hexColor(String(col));
@@ -1151,8 +1199,8 @@ function txbxRunPropsXml(marks: TiptapNode['marks'] = [], blockLang?: string): s
   if (markPresent(marks, 'superscript')) parts.push('<w:vertAlign w:val="superscript"/>');
   else if (markPresent(marks, 'subscript')) parts.push('<w:vertAlign w:val="subscript"/>');
   // Last in CT_RPr's order, and the only place Word reads a run's language from.
-  const lang = ts?.attrs?.lang ?? blockLang;
-  if (lang) parts.push(langXml(String(lang)));
+  const lang = langXml(...blockLangs, ts?.attrs?.lang, ts?.attrs?.langAsian);
+  if (lang) parts.push(lang);
   return parts.length ? `<w:rPr>${parts.join('')}</w:rPr>` : '';
 }
 
@@ -1187,7 +1235,7 @@ function txbxImageXml(node: TiptapNode, parts: TxbxParts): string {
     `<wp:extent cx="${cx}" cy="${cy}"/><wp:docPr id="${9000 + n}" name="Picture ${n}" descr="${alt}"/>` +
     `<a:graphic xmlns:a="${A_NS}"><a:graphicData uri="${PIC_NS}">` +
     `<pic:pic xmlns:pic="${PIC_NS}"><pic:nvPicPr><pic:cNvPr id="${9000 + n}" name="Picture ${n}"/><pic:cNvPicPr/></pic:nvPicPr>` +
-    `<pic:blipFill><a:blip r:embed="${rid}" xmlns:r="${R_NS}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>` +
+    `<pic:blipFill><a:blip r:embed="${rid}" xmlns:r="${R_NS}"/>${srcRectXml(cropOf(node.attrs?.crop))}<a:stretch><a:fillRect/></a:stretch></pic:blipFill>` +
     `<pic:spPr><a:xfrm${typeof node.attrs?.rotation === 'number' && node.attrs.rotation ? ` rot="${Math.round(node.attrs.rotation * 60000)}"` : ''}><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm>` +
     `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic>` +
     `</a:graphicData></a:graphic></wp:inline></w:drawing>`
@@ -1196,7 +1244,7 @@ function txbxImageXml(node: TiptapNode, parts: TxbxParts): string {
 
 // The box paragraph's own formatting, hand-serialized in CT_PPr child order
 // (pBdr, shd, bidi, spacing, ind, jc) — mirrors what paragraphToDocx hands the package.
-function txbxPPrXml(attrs: TiptapNode['attrs'], indentTwip: number): string {
+function txbxPPrXml(attrs: TiptapNode['attrs'], indentTwip: number, pt: number): string {
   const out: string[] = [];
   const borders = paraBordersOf(attrs);
   if (borders) {
@@ -1214,18 +1262,22 @@ function txbxPPrXml(attrs: TiptapNode['attrs'], indentTwip: number): string {
       + `${s.line != null ? ` w:line="${s.line}" w:lineRule="${s.lineRule === LineRuleType.EXACT ? 'exact' : 'auto'}"` : ''}/>`);
   }
   const ind: string[] = [];
-  if (typeof attrs?.indent === 'number' && attrs.indent > 0) ind.push(` w:left="${cmToTwip(attrs.indent)}"`);
+  const left = leftCm(attrs, pt);
+  if (left > 0) ind.push(` w:left="${cmToTwip(left)}"`);
   else if (indentTwip) ind.push(` w:left="${indentTwip}"`);
-  if (typeof attrs?.indentRight === 'number' && attrs.indentRight > 0) ind.push(` w:right="${cmToTwip(attrs.indentRight)}"`);
-  if (typeof attrs?.indentFirst === 'number' && attrs.indentFirst !== 0) {
-    ind.push(attrs.indentFirst < 0 ? ` w:hanging="${cmToTwip(-attrs.indentFirst)}"` : ` w:firstLine="${cmToTwip(attrs.indentFirst)}"`);
-  }
+  const right = rightCm(attrs, pt);
+  if (right > 0) ind.push(` w:right="${cmToTwip(right)}"`);
+  const first = firstLineCm(attrs, pt);
+  if (first) ind.push(first < 0 ? ` w:hanging="${cmToTwip(-first)}"` : ` w:firstLine="${cmToTwip(first)}"`);
+  const chars = indentCharsPayload(attrs);
+  if (chars) ind.push(...chars.split(' ').map((kv) => ` w:${kv.replace('=', '="')}"`));
   if (ind.length) out.push(`<w:ind${ind.join('')}/>`);
   const ta = attrs?.textAlign;
   const jc = ta === 'center' ? 'center' : ta === 'right' ? 'right' : ta === 'justify' ? 'both' : '';
   if (jc) out.push(`<w:jc w:val="${jc}"/>`);
   // w:rPr closes CT_PPr; it formats the paragraph mark and names the block's language.
-  if (typeof attrs?.lang === 'string' && attrs.lang) out.push(`<w:rPr>${langXml(attrs.lang)}</w:rPr>`);
+  const lang = langXml(attrs?.lang, attrs?.langAsian);
+  if (lang) out.push(`<w:rPr>${lang}</w:rPr>`);
   return out.join('');
 }
 
@@ -1238,9 +1290,8 @@ function txbxParagraphXml(node: TiptapNode, parts: TxbxParts, indentTwip = 0, nu
     const lvl = Math.min(MAX_HEADING_LEVEL, Math.max(1, Number(attrs.level) || 1));
     pPr.push(`<w:pStyle w:val="Heading${lvl}"/>`);
   }
-  pPr.push(numPr, txbxPPrXml(attrs, indentTwip));
-  const blockLang = typeof attrs.lang === 'string' && attrs.lang ? attrs.lang : undefined;
-  const runProps = (marks: TiptapNode['marks']) => txbxRunPropsXml(marks, blockLang);
+  pPr.push(numPr, txbxPPrXml(attrs, indentTwip, blockPt(node)));
+  const runProps = (marks: TiptapNode['marks']) => txbxRunPropsXml(marks, [attrs.lang, attrs.langAsian]);
   let runs = '';
   // Comment ranges and bookmarks bracket consecutive runs sharing the mark, as
   // inlineToRuns does for the body; the reference run is what Word draws the bubble from.
@@ -1307,6 +1358,13 @@ function txbxParagraphXml(node: TiptapNode, parts: TxbxParts, indentTwip = 0, nu
         ? `<w:r>${runProps(child.marks)}<w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r>`
         : `<w:fldSimple w:instr="${escapeXml(instr)}"><w:r>` +
           `<w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:fldSimple>`;
+    } else if (child.type === 'pageNumber' || child.type === 'pageCount' || child.type === 'chapterField') {
+      // A header's page fields, the same fields the zone's own runs carry.
+      const instr = child.type === 'pageNumber' ? 'PAGE' : child.type === 'pageCount' ? 'NUMPAGES'
+        : `STYLEREF ${Number(child.attrs?.level) || 1} \\* MERGEFORMAT`;
+      const shown = child.type === 'chapterField' ? String(child.attrs?.text ?? '') : '1';
+      runs += `<w:fldSimple w:instr="${escapeXml(instr)}"><w:r>` +
+        `${runProps(child.marks)}<w:t xml:space="preserve">${escapeXml(shown)}</w:t></w:r></w:fldSimple>`;
     } else if (child.type === 'formula') {
       // A sentinel run, resolved by applyFormulasDocx — it runs after the boxes are packed.
       const latex = typeof child.attrs?.latex === 'string' ? child.attrs.latex : '';
@@ -1372,11 +1430,13 @@ function txbxLevelXml(node: TiptapNode, depth: number, chained: boolean, cycle: 
       : `%${depth + 1}${def.numSuffix}`;
   const start = ordered && typeof node.attrs?.start === 'number' ? node.attrs.start : 1;
   const jc = node.attrs?.markerAlign === 'right' ? 'right' : 'left';
+  const suff = node.attrs?.markerSuffix === 'space' || node.attrs?.markerSuffix === 'nothing' ? `<w:suff w:val="${node.attrs.markerSuffix}"/>` : '';
+  const hang = listHangIndent(typeof node.attrs?.hanging === 'number' ? node.attrs.hanging : null);
+  const hangXml = hang.firstLine != null ? ` w:firstLine="${hang.firstLine}"` : ` w:hanging="${hang.hanging}"`;
   return (
-    `<w:lvl w:ilvl="${depth}"><w:start w:val="${start}"/><w:numFmt w:val="${fmt}"/>` +
+    `<w:lvl w:ilvl="${depth}"><w:start w:val="${start}"/><w:numFmt w:val="${fmt}"/>${suff}` +
     `<w:lvlText w:val="${escapeXml(text)}"/><w:lvlJc w:val="${jc}"/>` +
-    `<w:pPr><w:ind w:left="${cmToTwip((depth + 1) * LIST_LEFT_STEP_CM)}"` +
-    ` w:hanging="${cmToTwip(LIST_HANGING_CM)}"/></w:pPr></w:lvl>`
+    `<w:pPr><w:ind w:left="${cmToTwip((depth + 1) * LIST_LEFT_STEP_CM)}"${hangXml}/></w:pPr></w:lvl>`
   );
 }
 
@@ -1489,8 +1549,8 @@ function textBoxDrawingXml(box: TextBoxDocx, index: number, parts: TxbxParts): s
     ` simplePos="0" relativeHeight="${251658240 + index}" behindDoc="${box.wrap === 'through' && !box.inFront ? 1 : 0}" locked="0" layoutInCell="1" allowOverlap="${box.wrap === 'through' ? 1 : 0}">` +
     `<wp:simplePos x="0" y="0"/>` +
     `<wp:positionH relativeFrom="margin">${posH}</wp:positionH>` +
-    (box.fromPage
-      ? `<wp:positionV relativeFrom="page"><wp:posOffset>${Math.round((box.offsetYCm ?? 0) * 360000)}</wp:posOffset></wp:positionV>`
+    (box.fromPage || box.fromBody
+      ? `<wp:positionV relativeFrom="${box.fromPage ? 'page' : 'margin'}"><wp:posOffset>${Math.round((box.offsetYCm ?? 0) * 360000)}</wp:posOffset></wp:positionV>`
       : `<wp:positionV relativeFrom="paragraph"><wp:posOffset>${paraOffsetEmu(box.offsetYCm ?? 0)}</wp:posOffset></wp:positionV>`) +
     `${extent}${wrapEl}${docPr}${graphic}</wp:anchor></w:drawing>`
   );
@@ -1503,62 +1563,101 @@ function maxIdIn(xml: string, attr: RegExp): number {
   return max;
 }
 
-// Post-pack pass: swap each marker paragraph in word/document.xml for its drawing.
+// The parts a run can land in: a note's text and a header or footer are parts of their
+// own, so a sentinel pass that only rewrote document.xml would leave it standing there.
+const textParts = (files: Record<string, Uint8Array>): string[] =>
+  Object.keys(files).filter((p) => /^word\/(document|footnotes|endnotes|header\d*|footer\d*)\.xml$/.test(p));
+const relsOf = (part: string) => part.replace(/^word\/(.*)$/, 'word/_rels/$1.rels');
+const EMPTY_RELS = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>';
+
+// Post-pack pass: a picture whose name carries a crop gets it as its a:srcRect, and
+// the name loses the mark.
+function applyCropsDocx(bytes: Uint8Array): Uint8Array {
+  const files = unzipSync(bytes);
+  let hit = false;
+  const mark = new RegExp(`${CROP}([\\d.,e-]+)${CROP}`);
+  for (const part of textParts(files)) {
+    const xml = strFromU8(files[part]);
+    if (!xml.includes(CROP)) continue;
+    hit = true;
+    files[part] = strToU8(xml.replace(/<w:drawing>[\s\S]*?<\/w:drawing>/g, (d) => {
+      const m = mark.exec(d);
+      if (!m) return d;
+      const [l, t, r, b] = m[1].split(',').map(Number);
+      return d.replace('<a:srcRect/>', srcRectXml(cropOf({ l, t, r, b })))
+        .replace(new RegExp(`${CROP}[\\d.,e-]+${CROP}`, 'g'), '');
+    }));
+  }
+  if (!hit) return bytes;
+  const out: Record<string, [Uint8Array, { level: 6 }]> = {};
+  for (const [path, data] of Object.entries(files)) out[path] = [data, { level: 6 }];
+  return zipSync(out);
+}
+
+// Post-pack pass: swap each marker paragraph in a text part for its drawing.
 // The tempered pattern keeps the match inside one paragraph. A box's pictures and
 // lists need parts of their own — the pass holds the whole zip, so it appends the
 // media entries, their relationships and the numbering definitions here.
 function applyTextBoxesDocx(bytes: Uint8Array, boxes: TextBoxDocx[]): Uint8Array {
   if (!boxes.length) return bytes;
   const files = unzipSync(bytes);
-  const docBytes = files['word/document.xml'];
-  if (!docBytes) return bytes;
-  let xml = strFromU8(docBytes);
-
-  const relsPath = 'word/_rels/document.xml.rels';
-  const rels = files[relsPath] ? strFromU8(files[relsPath]) : '';
-  let nextRid = maxIdIn(rels, /Id="rId(\d+)"/g);
   let nextBm = 8000;
-  const parts: TxbxParts = { media: [], nums: [], links: [], nextRid: () => `rId${++nextRid}`, nextBookmarkId: () => ++nextBm };
+  // Media and numbering are named package-wide; relationships are each part's own.
+  const media: TxbxParts['media'] = [];
+  const nums: TxbxParts['nums'] = [];
 
-  // Only the marker run is rebuilt — the paragraph around it keeps its own properties
-  // and whatever text stands beside the box. Tempered so a match can't span two runs.
-  xml = xml.replace(
-    new RegExp(`<w:r\\b[^>]*?>(?:(?!</w:r>)[\\s\\S])*?${TBX}(\\d+)${TBX}(?:(?!</w:r>)[\\s\\S])*?</w:r>`, 'g'),
-    (_m, idx: string) => {
-      const box = boxes[Number(idx)];
-      return box ? `<w:r>${textBoxDrawingXml(box, Number(idx), parts)}</w:r>` : '';
-    },
-  );
+  for (const part of textParts(files)) {
+    let xml = strFromU8(files[part]);
+    if (!xml.includes(TBX)) continue;
+    const relsPath = relsOf(part);
+    const rels = files[relsPath] ? strFromU8(files[relsPath]) : EMPTY_RELS;
+    let nextRid = maxIdIn(rels, /Id="rId(\d+)"/g);
+    const from = media.length;
+    const parts: TxbxParts = { media, nums, links: [], nextRid: () => `rId${++nextRid}`, nextBookmarkId: () => ++nextBm };
+
+    // Only the marker run is rebuilt — the paragraph around it keeps its own properties
+    // and whatever text stands beside the box. Tempered so a match can't span two runs.
+    xml = xml.replace(
+      new RegExp(`<w:r\\b[^>]*?>(?:(?!</w:r>)[\\s\\S])*?${TBX}(\\d+)${TBX}(?:(?!</w:r>)[\\s\\S])*?</w:r>`, 'g'),
+      (_m, idx: string) => {
+        const box = boxes[Number(idx)];
+        return box ? `<w:r>${textBoxDrawingXml(box, Number(idx), parts)}</w:r>` : '';
+      },
+    );
+    files[part] = strToU8(xml);
+
+    const added = media.slice(from);
+    if (added.length || parts.links.length) {
+      files[relsPath] = strToU8(rels.replace('</Relationships>', added.map((m) =>
+        `<Relationship Id="${m.rid}" Type="${R_NS}/image" Target="media/${m.path.split('/').pop()}"/>`).join('') +
+        parts.links.map((l) =>
+          `<Relationship Id="${l.rid}" Type="${R_NS}/hyperlink" Target="${escapeXml(l.href)}" TargetMode="External"/>`).join('') +
+        '</Relationships>'));
+    }
+  }
+  for (const m of media) files[m.path] = m.bytes as Uint8Array<ArrayBuffer>;
 
   const numPath = 'word/numbering.xml';
   const numXml = files[numPath] ? strFromU8(files[numPath]) : '';
-  if (parts.nums.length && numXml) {
+  if (nums.length && numXml) {
     // Both id spaces are the package's, so one free number above its highest serves
     // as the abstract id and the concrete one alike.
     const base = Math.max(maxIdIn(numXml, /w:abstractNumId="(\d+)"/g), maxIdIn(numXml, /w:numId="(\d+)"/g)) + 1;
-    const abstracts = parts.nums.map((n, i) =>
+    const abstracts = nums.map((n, i) =>
       `<w:abstractNum w:abstractNumId="${base + i}"><w:multiLevelType w:val="hybridMultilevel"/>` +
       `${n.levels.filter(Boolean).join('')}</w:abstractNum>`).join('');
-    const concretes = parts.nums.map((_n, i) =>
+    const concretes = nums.map((_n, i) =>
       `<w:num w:numId="${base + i}"><w:abstractNumId w:val="${base + i}"/></w:num>`).join('');
     // w:abstractNum must precede every w:num, so both go where the first w:num is.
     const at = numXml.indexOf('<w:num ');
     files[numPath] = strToU8(at < 0
       ? numXml.replace('</w:numbering>', `${abstracts}${concretes}</w:numbering>`)
       : numXml.slice(0, at) + abstracts + concretes + numXml.slice(at));
-    xml = xml.replace(new RegExp(`${TXBX_NUM}(\\d+)${TXBX_NUM}`, 'g'), (_m, i: string) => String(base + Number(i)));
+    for (const part of textParts(files)) {
+      files[part] = strToU8(strFromU8(files[part]).replace(new RegExp(`${TXBX_NUM}(\\d+)${TXBX_NUM}`, 'g'), (_m, i: string) => String(base + Number(i))));
+    }
   }
 
-  if ((parts.media.length || parts.links.length) && rels) {
-    for (const m of parts.media) files[m.path] = m.bytes as Uint8Array<ArrayBuffer>;
-    files[relsPath] = strToU8(rels.replace('</Relationships>', parts.media.map((m) =>
-      `<Relationship Id="${m.rid}" Type="${R_NS}/image" Target="media/${m.path.split('/').pop()}"/>`).join('') +
-      parts.links.map((l) =>
-        `<Relationship Id="${l.rid}" Type="${R_NS}/hyperlink" Target="${escapeXml(l.href)}" TargetMode="External"/>`).join('') +
-      '</Relationships>'));
-  }
-
-  files['word/document.xml'] = strToU8(xml);
   const out: Record<string, [Uint8Array, { level: 6 }]> = {};
   for (const [path, data] of Object.entries(files)) out[path] = [data, { level: 6 }];
   return zipSync(out);
@@ -1719,9 +1818,6 @@ function applyBibliographyDocx(bytes: Uint8Array, sources: BibSource[], cite: Ci
   return zipSync(out);
 }
 
-// The parts a body run can land in: a note's text is its own part, so a sentinel pass
-// that only rewrote document.xml would leave the sentinel standing in a note.
-const NOTE_BEARING_PARTS = ['word/document.xml', 'word/footnotes.xml', 'word/endnotes.xml'];
 
 // Post-pack pass: swap each sentinel run for its <m:oMath>. A display formula
 // additionally wraps its paragraph's content in <m:oMathPara>, which is how Word
@@ -1733,7 +1829,7 @@ function applyFormulasDocx(bytes: Uint8Array, formulas: FormulaDocx[]): Uint8Arr
   // may cross neither </w:r> nor a nested <w:r> (a box's drawing run wraps whole
   // paragraphs, so matching from it would swallow the box preamble).
   const pattern = new RegExp(`<w:r\\b[^>]*?>(?:(?!</?w:r[\\s>])[\\s\\S])*?${MTH}(\\d+)${MTH}(?:(?!</?w:r[\\s>])[\\s\\S])*?</w:r>`, 'g');
-  for (const part of NOTE_BEARING_PARTS) {
+  for (const part of textParts(files)) {
     const partBytes = files[part];
     if (!partBytes) continue;
     files[part] = strToU8(strFromU8(partBytes).replace(pattern, (_m, idx: string) => {
@@ -1769,8 +1865,8 @@ function applyRubyDocx(bytes: Uint8Array, rubies: RubyDocx[]): Uint8Array {
         + `<w:rt>${run(r.text, 12)}</w:rt><w:rubyBase>${run(r.base)}</w:rubyBase></w:ruby></w:r>`;
     },
   );
-  for (const part of NOTE_BEARING_PARTS) {
-    if (files[part]) files[part] = strToU8(rewrite(strFromU8(files[part])));
+  for (const part of textParts(files)) {
+    files[part] = strToU8(rewrite(strFromU8(files[part])));
   }
   const out: Record<string, [Uint8Array, { level: 6 }]> = {};
   for (const [path, data] of Object.entries(files)) out[path] = [data, { level: 6 }];
@@ -1783,10 +1879,7 @@ function applyRubyDocx(bytes: Uint8Array, rubies: RubyDocx[]): Uint8Array {
 function applyPlaceholdersDocx(bytes: Uint8Array, placeholders: string[]): Uint8Array {
   if (!placeholders.length) return bytes;
   const files = unzipSync(bytes);
-  const docBytes = files['word/document.xml'];
-  if (!docBytes) return bytes;
-  let xml = strFromU8(docBytes);
-  xml = xml.replace(
+  for (const part of textParts(files)) files[part] = strToU8(strFromU8(files[part]).replace(
     new RegExp(`<w:r\\b[^>]*?>(?:(?!</?w:r[\\s>])[\\s\\S])*?${PLH}(\\d+)${PLH}(?:(?!</?w:r[\\s>])[\\s\\S])*?</w:r>`, 'g'),
     (m, idx: string) => {
       const label = placeholders[Number(idx)];
@@ -1797,8 +1890,7 @@ function applyPlaceholdersDocx(bytes: Uint8Array, placeholders: string[]): Uint8
         + '<w:temporary/><w:text/></w:sdtPr><w:sdtContent>'
         + `<w:r>${rpr}<w:t xml:space="preserve">${escapeXml(label)}</w:t></w:r></w:sdtContent></w:sdt>`;
     },
-  );
-  files['word/document.xml'] = strToU8(xml);
+  ));
   const out: Record<string, [Uint8Array, { level: 6 }]> = {};
   for (const [path, data] of Object.entries(files)) out[path] = [data, { level: 6 }];
   return zipSync(out);
@@ -1937,17 +2029,18 @@ function patchPackedXml(bytes: Uint8Array): Uint8Array {
   return zipSync(out);
 }
 
-// Post-pack pass: no space above the block that opens a page — Word keeps it in the
-// compatibility set, where LibreOffice reads it into AddParaTableSpacingAtStart.
-function applySpacingAtStartDocx(bytes: Uint8Array): Uint8Array {
+// Post-pack pass: compatibility options, which the docx lib cannot write — flags in
+// CT_Compat's order, since they go in ahead of its own w:compatSetting entries.
+function applyCompatDocx(bytes: Uint8Array, flags: string[]): Uint8Array {
+  if (!flags.length) return bytes;
   const files = unzipSync(bytes);
   const setBytes = files['word/settings.xml'];
   if (!setBytes) return bytes;
   const xml = strFromU8(setBytes);
-  if (xml.includes('w:suppressSpBfAfterPgBrk')) return bytes;
+  const els = flags.filter((f) => !xml.includes(`w:${f}`)).map((f) => `<w:${f}/>`).join('');
   files['word/settings.xml'] = strToU8(/<w:compat\b[^>]*>/.test(xml)
-    ? xml.replace(/(<w:compat\b[^>]*>)/, '$1<w:suppressSpBfAfterPgBrk/>')
-    : xml.replace(/(<w:settings\b[^>]*>)/, '$1<w:compat><w:suppressSpBfAfterPgBrk/></w:compat>'));
+    ? xml.replace(/(<w:compat\b[^>]*>)/, `$1${els}`)
+    : xml.replace(/(<w:settings\b[^>]*>)/, `$1<w:compat>${els}</w:compat>`));
   const out: Record<string, [Uint8Array, { level: 6 }]> = {};
   for (const [path, data] of Object.entries(files)) out[path] = [data, { level: 6 }];
   return zipSync(out);
@@ -2284,30 +2377,46 @@ function applyBidiDocx(bytes: Uint8Array): Uint8Array {
   return zipSync(out);
 }
 
-// The w:pPr children that follow w:suppressAutoHyphens in CT_PPrBase — Word's schema is
-// a sequence, so the flag goes in before the first of them.
-const AFTER_SUPPRESS_HYPHENS = /<w:(kinsoku|wordWrap|overflowPunct|topLinePunct|autoSpace|bidi|adjustRightInd|snapToGrid|spacing|ind|contextualSpacing|mirrorIndents|suppressOverlap|jc|textDirection|textAlignment|textboxTightWrap|outlineLvl|divId|cnfStyle|rPr|sectPr)\b/;
+// Paragraph flags the docx package does not expose, each with the w:pPr children that
+// follow it in CT_PPrBase — Word's schema is a sequence, so it goes in before the first.
+const PPR_TAIL = 'spacing|ind|contextualSpacing|mirrorIndents|suppressOverlap|jc|textDirection|textAlignment|textboxTightWrap|outlineLvl|divId|cnfStyle|rPr|sectPr';
+const PPR_FLAGS = [
+  { mark: NOHYP, xml: '<w:suppressAutoHyphens/>',
+    before: new RegExp(`<w:(kinsoku|wordWrap|overflowPunct|topLinePunct|autoSpace|bidi|adjustRightInd|snapToGrid|${PPR_TAIL})\\b`) },
+  { mark: NOSNAP, xml: '<w:snapToGrid w:val="0"/>', before: new RegExp(`<w:(${PPR_TAIL})\\b`) },
+];
 
-// Post-pack pass: "don't hyphenate this paragraph" is <w:suppressAutoHyphens/> in w:pPr,
-// which the docx package does not expose. The paragraph carries the NOHYP run instead;
-// this drops that run and writes the flag.
-function applyNoHyphensDocx(bytes: Uint8Array): Uint8Array {
+// Post-pack pass: the paragraph carries a marker run per flag instead; this drops the
+// run and writes the flag into w:pPr.
+function applyParagraphFlagsDocx(bytes: Uint8Array): Uint8Array {
   const files = unzipSync(bytes);
-  const docBytes = files['word/document.xml'];
-  if (!docBytes) return bytes;
-  let xml = strFromU8(docBytes);
-  if (!xml.includes(NOHYP)) return bytes;
-  xml = xml.replace(/<w:p\b[^>]*>[\s\S]*?<\/w:p>/g, (para) => {
-    if (!para.includes(NOHYP)) return para;
-    const p = para.replace(new RegExp(`<w:r>(?:(?!</w:r>)[\\s\\S])*${NOHYP}(?:(?!</w:r>)[\\s\\S])*</w:r>`, 'g'), '');
-    const pPr = /<w:pPr>[\s\S]*?<\/w:pPr>/.exec(p);
-    if (!pPr) return p.replace(/^(<w:p\b[^>]*>)/, '$1<w:pPr><w:suppressAutoHyphens/></w:pPr>');
-    const patched = AFTER_SUPPRESS_HYPHENS.test(pPr[0])
-      ? pPr[0].replace(AFTER_SUPPRESS_HYPHENS, '<w:suppressAutoHyphens/>$&')
-      : pPr[0].replace('</w:pPr>', '<w:suppressAutoHyphens/></w:pPr>');
-    return p.replace(pPr[0], patched);
-  });
-  files['word/document.xml'] = strToU8(xml);
+  let changed = false;
+  for (const part of textParts(files)) {
+    let xml = strFromU8(files[part]);
+    const flags = PPR_FLAGS.filter((f) => xml.includes(f.mark));
+    if (!flags.length && !xml.includes(INDC)) continue;
+    changed = true;
+    xml = xml.replace(/<w:p\b[^>]*>[\s\S]*?<\/w:p>/g, (para) => {
+      let p = para;
+      const indc = new RegExp(`<w:r>(?:(?!</w:r>)[\\s\\S])*${INDC}([^${INDC}]*)${INDC}(?:(?!</w:r>)[\\s\\S])*</w:r>`).exec(p);
+      // The payload is 'name=value' pairs; the run text would escape an XML quote.
+      const indAttrs = indc?.[1].split(' ').map((kv) => ` w:${kv.replace('=', '="')}"`).join('');
+      if (indc) p = p.replace(indc[0], '').replace(/<w:ind\b/, `$&${indAttrs}`);
+      for (const f of flags) {
+        if (!p.includes(f.mark)) continue;
+        p = p.replace(new RegExp(`<w:r>(?:(?!</w:r>)[\\s\\S])*${f.mark}(?:(?!</w:r>)[\\s\\S])*</w:r>`, 'g'), '');
+        const pPr = /<w:pPr>[\s\S]*?<\/w:pPr>/.exec(p);
+        if (!pPr) { p = p.replace(/^(<w:p\b[^>]*>)/, `$1<w:pPr>${f.xml}</w:pPr>`); continue; }
+        const patched = f.before.test(pPr[0])
+          ? pPr[0].replace(f.before, `${f.xml}$&`)
+          : pPr[0].replace('</w:pPr>', `${f.xml}</w:pPr>`);
+        p = p.replace(pPr[0], patched);
+      }
+      return p;
+    });
+    files[part] = strToU8(xml);
+  }
+  if (!changed) return bytes;
   const out: Record<string, [Uint8Array, { level: 6 }]> = {};
   for (const [path, data] of Object.entries(files)) out[path] = [data, { level: 6 }];
   return zipSync(out);
@@ -2375,15 +2484,19 @@ function paraBordersOf(attrs: TiptapNode['attrs']) {
 function paragraphToDocx(node: TiptapNode, opts: ParaOpts = {}): Paragraph {
   const attrs = node.attrs ?? {};
   const indent: Writable<IIndentAttributesProperties> = {};
+  const pt = blockPt(node);
+  const indChars = opts.numbering ? '' : indentCharsPayload(attrs);
   if (!opts.numbering) {
-    if (typeof attrs.indent === 'number' && attrs.indent > 0) indent.left = cmToTwip(attrs.indent);
+    const left = leftCm(attrs, pt);
+    // An explicit 0 is kept: it overrides the named style's indent.
+    if (left > 0 || attrs.indent === 0) indent.left = cmToTwip(left);
     else if (opts.indentLeftTwip) indent.left = opts.indentLeftTwip;
-    if (typeof attrs.indentRight === 'number' && attrs.indentRight > 0) indent.right = cmToTwip(attrs.indentRight);
+    const right = rightCm(attrs, pt);
+    if (right > 0) indent.right = cmToTwip(right);
     // Word splits the first-line indent into two exclusive attributes by sign.
-    if (typeof attrs.indentFirst === 'number' && attrs.indentFirst !== 0) {
-      if (attrs.indentFirst < 0) indent.hanging = cmToTwip(-attrs.indentFirst);
-      else indent.firstLine = cmToTwip(attrs.indentFirst);
-    }
+    const first = firstLineCm(attrs, pt);
+    if (first < 0) indent.hanging = cmToTwip(-first);
+    else if (first > 0) indent.firstLine = cmToTwip(first);
   }
   // The block's named style (a heading style id is what HeadingLevel references anyway).
   const style = docxStyleId(styleOf(node));
@@ -2392,9 +2505,12 @@ function paragraphToDocx(node: TiptapNode, opts: ParaOpts = {}): Paragraph {
   const stops = parseTabStops(attrs.tabStops);
   // Paragraph-mark run props carry the block's own font (see import/docx.ts).
   const markSize = typeof attrs.fontSize === 'string' ? fontSizeToHalfPoints(attrs.fontSize) : undefined;
-  const markFont = typeof attrs.fontFamily === 'string' && attrs.fontFamily ? attrs.fontFamily : undefined;
-  const blockLang = typeof attrs.lang === 'string' && attrs.lang ? attrs.lang : undefined;
-  const runForce = blockLang ? { ...opts.force, lang: blockLang } : opts.force;
+  const markFont = fontPair(attrs.fontFamily, attrs.fontFamilyAsian, (f) => f);
+  const str = (v: unknown) => (typeof v === 'string' && v ? v : undefined);
+  const blockLang = langProp(attrs.lang, attrs.langAsian);
+  const runForce = blockLang
+    ? { ...opts.force, lang: str(attrs.lang) ?? opts.force?.lang, langAsian: str(attrs.langAsian) ?? opts.force?.langAsian }
+    : opts.force;
   return new Paragraph({
     style,
     alignment: alignOf(attrs),
@@ -2405,7 +2521,7 @@ function paragraphToDocx(node: TiptapNode, opts: ParaOpts = {}): Paragraph {
     // a style of its own ("Appendix 1") has nothing else that says what level it is.
     outlineLevel: node.type === 'heading' ? ((attrs.level as number) ?? 1) - 1 : undefined,
     widowControl: attrs.widowControl === false ? false : undefined,
-    keepNext: attrs.keepNext === true || undefined,
+    keepNext: typeof attrs.keepNext === 'boolean' ? attrs.keepNext : undefined,
     keepLines: attrs.keepLines === true || undefined,
     // w:bidi — the block's own base direction (textDirection.ts).
     bidirectional: attrs.dir === 'rtl' ? true : attrs.dir === 'ltr' ? false : undefined,
@@ -2416,10 +2532,13 @@ function paragraphToDocx(node: TiptapNode, opts: ParaOpts = {}): Paragraph {
     shading: paraShadingOf(attrs),
     border: paraBordersOf(attrs),
     // The paragraph mark's own run properties; the language there formats the mark alone.
-    run: markSize || markFont || blockLang ? { size: markSize, font: markFont, language: blockLang ? langProp(blockLang) : undefined } : undefined,
-    children: attrs.noHyphenation === true
-      ? [new TextRun(NOHYP), ...inlineToRuns(node.content, runForce)]
-      : inlineToRuns(node.content, runForce),
+    run: markSize || markFont || blockLang ? { size: markSize, font: markFont, language: blockLang } : undefined,
+    children: [
+      ...(attrs.noHyphenation === true ? [new TextRun(NOHYP)] : []),
+      ...(attrs.snapToGrid === false ? [new TextRun(NOSNAP)] : []),
+      ...(indChars ? [new TextRun(`${INDC}${indChars}${INDC}`)] : []),
+      ...inlineToRuns(node.content, runForce),
+    ],
   });
 }
 
@@ -2443,6 +2562,7 @@ function listToParagraphs(
         listToParagraphs(child, depth + 1, ref, indentCm, num, out, cChild, style, ref === reference ? instance : 0);
       } else if (child.type === 'paragraph' || child.type === 'heading') {
         if (!numberedFirst) {
+          docZoneLists?.push({ reference, instance });
           out.push(paragraphToDocx(child, { numbering: { reference, level: depth, instance } }));
           numberedFirst = true;
         } else {
@@ -2736,6 +2856,17 @@ function tableFloatOptions(box: TiptapNode): ITableFloatOptions {
   };
 }
 
+// Word has no page break on a table: its first cell's paragraph asks for the page, and
+// both word processors move the whole table there.
+function breakInFirstCell(table: TiptapNode): TiptapNode {
+  const [row, ...rows] = table.content ?? [];
+  const [cell, ...cells] = row?.content ?? [];
+  const [para, ...rest] = cell?.content ?? [];
+  if (table.attrs?.breakBefore !== 'page' || (para?.type !== 'paragraph' && para?.type !== 'heading')) return table;
+  const first = { ...para, attrs: { ...para.attrs, breakBefore: 'page' } };
+  return { ...table, content: [{ ...row, content: [{ ...cell, content: [first, ...rest] }, ...cells] }, ...rows] };
+}
+
 // ---- top-level walk --------------------------------------------------------
 function blocksToDocx(content: TiptapNode[], num: Numbering, contentWidthCm: number): (Paragraph | Table | TableOfContents)[] {
   const out: (Paragraph | Table | TableOfContents)[] = [];
@@ -2747,7 +2878,7 @@ function blocksToDocx(content: TiptapNode[], num: Numbering, contentWidthCm: num
     } else if (node.type === 'bulletList' || node.type === 'orderedList') {
       listEntryToDocx(node, num, out);
     } else if (node.type === 'table') {
-      out.push(tableToDocx(node, contentWidthCm, num));
+      out.push(tableToDocx(breakInFirstCell(node), contentWidthCm, num));
     } else if (node.type === 'image') {
       out.push(new Paragraph({ children: inlineToRuns([node]) }));
     } else if (node.type === 'tableOfContents') {
@@ -2838,6 +2969,26 @@ function bodyGroups(content: TiptapNode[], num: Numbering, widthCm: (section: nu
 }
 
 // The style name a block carries: its own, else the node type's default.
+// The w:ind character attributes of a block, as 'name=value' pairs (hundredths of a
+// character). A hanging count adds to the left one on import, so it is taken off here.
+function indentCharsPayload(attrs: TiptapNode['attrs']): string {
+  const n = (v: unknown) => (typeof v === 'number' ? Math.round(v * 100) : 0);
+  const first = n(attrs?.indentFirstChars);
+  const left = n(attrs?.indentChars);
+  const right = n(attrs?.indentRightChars);
+  // A hanging count alone would read back as a left indent too, so it needs a left count.
+  const hanging = first < 0 && left ? -first : 0;
+  return [left ? `leftChars=${Math.max(0, left - hanging)}` : '', first > 0 ? `firstLineChars=${first}` : '',
+    hanging ? `hangingChars=${hanging}` : '', right ? `rightChars=${right}` : ''].filter(Boolean).join(' ');
+}
+
+// The size a block's unmarked text is set in, in points; a character indent counts in it.
+function blockPt(node: TiptapNode): number {
+  const own = node.attrs?.fontSize;
+  if (typeof own === 'string' && own) return parseFloat(own);
+  return resolveStyle(exportSheet, styleOf(node)).text.fontSizePt ?? 12;
+}
+
 function styleOf(node: TiptapNode): string {
   const own = node.attrs?.styleName;
   if (typeof own === 'string' && own) return own;
@@ -2888,7 +3039,8 @@ function paragraphStyleOf(style: Style): IParagraphStyleOptions {
   const t = style.text;
   const run: Writable<IRunStylePropertiesOptions> = {};
   // The registry holds the on-screen family; the file declares its metric twin.
-  if (t.fontFamily) run.font = twinFontName(t.fontFamily);
+  const font = fontPair(t.fontFamily, t.fontFamilyAsian, twinFontName);
+  if (font) run.font = font;
   if (t.fontSizePt != null) run.size = Math.round(t.fontSizePt * 2);
   if (t.letterSpacingPt) run.characterSpacing = Math.round(t.letterSpacingPt * 20);
   // Word kerns nothing unless a size to start at is named, so the on state is the one
@@ -2904,11 +3056,14 @@ function paragraphStyleOf(style: Style): IParagraphStyleOptions {
   const spacing: Record<string, number> = {};
   if (p.spaceBefore != null) spacing.before = ptToTwip(p.spaceBefore);
   if (p.spaceAfter != null) spacing.after = ptToTwip(p.spaceAfter);
-  // A proportional spacing is a factor of the single line (240 twips).
+  // A proportional spacing is a factor of the single line (240 twips), a fixed one pt.
   const factor = Number(p.lineHeight);
+  const fixedPt = /pt$/.test(p.lineHeight ?? '') ? parseFloat(p.lineHeight!) : NaN;
   if (Number.isFinite(factor) && factor > 0 && factor !== 1) spacing.line = Math.round(factor * 240);
+  else if (fixedPt > 0) spacing.line = ptToTwip(fixedPt);
   const paragraph: Record<string, unknown> = {};
-  if (Object.keys(spacing).length) paragraph.spacing = { ...spacing, ...(spacing.line ? { lineRule: LineRuleType.AUTO } : {}) };
+  const lineRule = fixedPt > 0 ? LineRuleType.EXACT : LineRuleType.AUTO;
+  if (Object.keys(spacing).length) paragraph.spacing = { ...spacing, ...(spacing.line ? { lineRule } : {}) };
   if (p.textAlign) paragraph.alignment = alignOf({ textAlign: p.textAlign });
   if (p.indent != null) paragraph.indent = { left: cmToTwip(p.indent) };
   if (style.outlineLevel) paragraph.keepNext = true;
@@ -2931,7 +3086,8 @@ function paragraphStyleOf(style: Style): IParagraphStyleOptions {
 // A run of text the model describes → Word's run properties.
 function runPropsOf(t: TextProps): Writable<IRunStylePropertiesOptions> {
   const run: Writable<IRunStylePropertiesOptions> = {};
-  if (t.fontFamily) run.font = t.fontFamily === 'Liberation Serif' ? DOC_FONT : t.fontFamily;
+  const font = fontPair(t.fontFamily, t.fontFamilyAsian, screenToDoc);
+  if (font) run.font = font;
   if (t.fontSizePt != null) run.size = Math.round(t.fontSizePt * 2);
   if (t.letterSpacingPt) run.characterSpacing = Math.round(t.letterSpacingPt * 20);
   if (t.kerning !== false) run.kern = 1;
@@ -3004,17 +3160,15 @@ const FACTORY_SLOTS: Record<string, string> = {
   Heading4: 'heading4', Heading5: 'heading5', Heading6: 'heading6',
 };
 
-function buildStyles(sheet: StyleSheet, used: Set<string>, language?: { language: string; country: string } | null) {
+function buildStyles(sheet: StyleSheet, used: Set<string>, language?: ExportLanguage | null) {
   const run: Writable<IRunStylePropertiesOptions> = { font: DOC_FONT, size: 24 };
   if (language) {
     const tag = `${language.language}-${language.country}`;
-    run.language = langProp(tag);
+    run.language = langProp(language.other, tag);
     // A plain font name reaches all four w:rFonts slots, east-asian included, which would
-    // make Times New Roman the default for every Han run. Only the document default is
-    // split here; a run still carries the one font it has.
-    if (isAsianTag(tag)) {
-      run.font = { ascii: DOC_FONT, hAnsi: DOC_FONT, cs: DOC_FONT, eastAsia: CJK_DOC_FONT[language.country] ?? CJK_DOC_FONT_DEFAULT };
-    }
+    // make Times New Roman the default for every Han run that names no asian font.
+    const cjk = cjkDocFont(tag);
+    if (cjk) run.font = { ascii: DOC_FONT, hAnsi: DOC_FONT, cs: DOC_FONT, eastAsia: cjk };
   }
   const slotted: Record<string, Omit<IParagraphStyleOptions, 'id' | 'name'>> = {};
   const paragraphStyles = Object.values(sheet.paragraph)
@@ -3051,7 +3205,7 @@ export async function buildDocx(
   margins: PageMargins = DEFAULT_MARGINS,
   orientation: Orientation = 'portrait',
   hf?: HfExport,
-  language?: { language: string; country: string } | null,
+  language?: ExportLanguage | null,
   pageFormat: PageFormat = 'A4',
   styles: StyleSheet = builtinStyleSheet(),
   tabIntervalCm: number = DEFAULT_TAB_INTERVAL_CM,
@@ -3067,6 +3221,8 @@ export async function buildDocx(
   foldMarks = false,
   spacingAtPageStart = true,
   fonts: EmbeddedFont[] = [],
+  lineGrid: LineGrid = DEFAULT_LINE_GRID,
+  balanceSpaces = false,
 ): Promise<Uint8Array> {
   docLangTag = localeTag(language ? language.language : 'en');
   // Before the walk: every picture the file can hold has to be a raster by then, and
@@ -3078,6 +3234,7 @@ export async function buildDocx(
   nextBookmarkId = 0;
   docxBookmarkNames = new Map();
   docRubies = [];
+  docCrops = false;
   docPlaceholders = [];
   docSources = [];
   const num = new Numbering();
@@ -3140,7 +3297,7 @@ export async function buildDocx(
     differentOddEven: !!hf?.differentOddEven,
   }];
   const setAt = (i: number) => hfSets[Math.min(i, hfSets.length - 1)];
-  const para = (d: HfDoc) => (hfIsEmpty(d) ? null : (d!.content![0] as TiptapNode));
+  const zone = (d: HfDoc) => (hfIsEmpty(d) ? null : (d!.content as TiptapNode[]));
   // Different odd & even pages is a document setting (w:evenAndOddHeaders), not a
   // section one, so any section asking for it turns it on.
   const differentOddEven = hfSets.some((s) => s.differentOddEven);
@@ -3185,14 +3342,18 @@ export async function buildDocx(
           : {})),
     };
   };
+  // A zone's blocks at its section's text width; a header has no index to hold.
+  const blocks = (content: TiptapNode[], i: number) =>
+    blocksToDocx(content, num, sectionWidthCm(i)) as (Paragraph | Table)[];
+  docZoneLists = [];
   // Fresh instances per section (Word's per-sectPr references, i.e. no "Link to
   // Previous"). A first-page variant rides `first:` and is activated by titlePage below.
   const mkHeaders = (i: number) => {
     const s = setAt(i);
     // Odd/even is the document's setting: a section not asking for it repeats its
     // running zone on even pages, so that is what its even part holds.
-    const d = para(s.header), f = s.differentFirstPage ? para(s.headerFirst) : null,
-      e = s.differentOddEven ? para(s.headerEven) : differentOddEven ? d : null;
+    const d = zone(s.header), f = s.differentFirstPage ? zone(s.headerFirst) : null,
+      e = s.differentOddEven ? zone(s.headerEven) : differentOddEven ? d : null;
     // A watermark (and the fold marks) lives in a header part, so every page variant
     // needs one — empty where the zone has no text — for the post-passes to inject
     // into; a variant without its own part would blank the decor on those pages.
@@ -3202,30 +3363,40 @@ export async function buildDocx(
     // put a chapter's running head on the pages a blank one was meant for.
     const spellOut = decorated || i > 0;
     const h: { default?: Header; first?: Header; even?: Header } = {};
-    if (d) h.default = new Header({ children: [paragraphToDocx(d)] });
+    if (d) h.default = new Header({ children: blocks(d, i) });
     else if (spellOut) h.default = new Header({ children: [new Paragraph({})] });
-    if (f) h.first = new Header({ children: [paragraphToDocx(f)] });
+    if (f) h.first = new Header({ children: blocks(f, i) });
     else if (s.differentFirstPage && spellOut) h.first = new Header({ children: [new Paragraph({})] });
-    if (e) h.even = new Header({ children: [paragraphToDocx(e)] });
+    if (e) h.even = new Header({ children: blocks(e, i) });
     else if (differentOddEven && spellOut) h.even = new Header({ children: [new Paragraph({})] });
     return Object.keys(h).length ? h : undefined;
   };
   const mkFooters = (i: number) => {
     const s = setAt(i);
-    const d = para(s.footer), f = s.differentFirstPage ? para(s.footerFirst) : null,
-      e = s.differentOddEven ? para(s.footerEven) : differentOddEven ? d : null;
+    const d = zone(s.footer), f = s.differentFirstPage ? zone(s.footerFirst) : null,
+      e = s.differentOddEven ? zone(s.footerEven) : differentOddEven ? d : null;
     if (!d && !f && !e && i === 0) return undefined;
     const fo: { default?: Footer; first?: Footer; even?: Footer } = {};
     // Spelled out past the first section, for the reason the headers are.
-    if (d) fo.default = new Footer({ children: [paragraphToDocx(d)] });
+    if (d) fo.default = new Footer({ children: blocks(d, i) });
     else if (i > 0) fo.default = new Footer({ children: [new Paragraph({})] });
-    if (f) fo.first = new Footer({ children: [paragraphToDocx(f)] });
+    if (f) fo.first = new Footer({ children: blocks(f, i) });
     else if (s.differentFirstPage && i > 0) fo.first = new Footer({ children: [new Paragraph({})] });
-    if (e) fo.even = new Footer({ children: [paragraphToDocx(e)] });
+    if (e) fo.even = new Footer({ children: blocks(e, i) });
     else if (differentOddEven && i > 0) fo.even = new Footer({ children: [new Paragraph({})] });
     return fo;
   };
 
+  // The zones are walked before the document is built: their lists register numbering
+  // the document reads when it is constructed. Only the group that begins a section's
+  // set carries them; a later columns group links to them ("Link to Previous"): a
+  // reference of its own makes LibreOffice switch page styles there, which breaks the
+  // page as a continuous break never may.
+  const groupZones = groups.map((g, i) => (groups.findIndex((x) => x.section === g.section) === i
+    ? { headers: mkHeaders(g.section), footers: mkFooters(g.section) } : { headers: undefined, footers: undefined }));
+  // Styles the zones name count as used, as the body's do.
+  const withZones: TiptapNode = { ...docJson, content: [...(docJson.content ?? []),
+    ...hfSets.flatMap((set) => HF_ZONE_KEYS.flatMap((k) => (set[k]?.content ?? []) as TiptapNode[]))] };
   const doc = new Document({
     // Word's File ▸ Info; an empty field is left out so it does not overwrite Word's own.
     // Creator and last modifier are what the library fills in ("Un-named") otherwise,
@@ -3245,7 +3416,7 @@ export async function buildDocx(
     ...(hasToc || recordChanges
       ? { features: { ...(hasToc ? { updateFields: true } : {}), ...(recordChanges ? { trackRevisions: true } : {}) } }
       : {}),
-    styles: buildStyles(styles, usedStyleNames(docJson, styles), language),
+    styles: buildStyles(styles, usedStyleNames(withZones, styles), language),
     numbering: { config: num.config },
     ...(Object.keys(notesByClass.footnote).length ? { footnotes: notesByClass.footnote } : {}),
     ...(Object.keys(notesByClass.endnote).length ? { endnotes: notesByClass.endnote } : {}),
@@ -3264,6 +3435,8 @@ export async function buildDocx(
     sections: groups.map((g, i) => ({
       properties: {
         page: pagePropsFor(g.section),
+        // Word's Document Grid, lines only; ODF keeps it on the page layout.
+        ...(lineGrid.on ? { grid: { type: DocumentGridType.LINES, linePitch: Math.round(lineGrid.pitchPt * 20) } } : {}),
         // Word's Layout ▸ Line Numbers; ODF keeps the same five values document-wide.
         ...(lineNumbering.on
           ? { lineNumbers: {
@@ -3290,22 +3463,21 @@ export async function buildDocx(
           ? { column: { count: g.columns.count, space: cmToTwip(g.columns.gapCm), equalWidth: true } }
           : {}),
       },
-      // A later columns group of its section links to the zones ("Link to Previous"): a
-      // reference of its own makes LibreOffice switch page styles there, which breaks
-      // the page as a continuous break never may.
-      headers: groups.findIndex((x) => x.section === g.section) === i ? mkHeaders(g.section) : undefined,
-      footers: groups.findIndex((x) => x.section === g.section) === i ? mkFooters(g.section) : undefined,
+      ...groupZones[i],
       children: g.children.length ? g.children : [new Paragraph({})],
     })),
   });
 
+  for (const { reference, instance } of docZoneLists) doc.Numbering.createConcreteNumberingInstance(reference, instance);
+  docZoneLists = null;
   const blob = await Packer.toBlob(doc);
   const styled = applyRawStylesDocx(new Uint8Array(await blob.arrayBuffer()), [
-    ...usedTableStyles(docJson, styles).map(tableStyleXml),
+    ...usedTableStyles(withZones, styles).map(tableStyleXml),
     ...num.styleLinks().map((l) => numberingStyleXml(l.name)),
   ]);
   const linked = applyOutlineNumberingDocx(applyListStylesDocx(styled, num.styleLinks()), outlineIndex);
-  const packed = applyFormulasDocx(applyTextBoxesDocx(linked, docTextBoxes), docFormulas);
+  const formulas = applyFormulasDocx(applyTextBoxesDocx(linked, docTextBoxes), docFormulas);
+  const packed = docCrops ? applyCropsDocx(formulas) : formulas;
   const cited = applyBibliographyDocx(applyPlaceholdersDocx(applyRubyDocx(packed, docRubies), docPlaceholders), docSources, docCitationStyle(docJson));
   // The note configuration goes out whether or not a note exists yet, as Word keeps its
   // own in settings.xml — a document numbering its first footnote from 3 must still say so.
@@ -3313,10 +3485,14 @@ export async function buildDocx(
   const withNotes = docNoteIds.size ? applyEndnoteImagesDocx(applyNoteMarksDocx(applyNoteBookmarksDocx(withNotePr))) : withNotePr;
   const threaded = applyCommentsExtendedDocx(withNotes);
   const mirrored = margins.mirrored ? applyMirrorMarginsDocx(threaded) : threaded;
-  const bidi = applyNoHyphensDocx(rtl ? applyBidiDocx(mirrored) : mirrored);
+  const bidi = applyParagraphFlagsDocx(rtl ? applyBidiDocx(mirrored) : mirrored);
   const dims = pageDimsCm(pageFormat, orientation);
   const foldMarked = applyFoldMarksDocx(bidi, foldMarks, dims.w * 10);
-  const spaced = spacingAtPageStart ? foldMarked : applySpacingAtStartDocx(foldMarked);
+  // No space above the block opening a page is Word's w:suppressSpBfAfterPgBrk.
+  const spaced = applyCompatDocx(foldMarked, [
+    ...(balanceSpaces ? ['balanceSingleByteDoubleByteWidth'] : []),
+    ...(spacingAtPageStart ? [] : ['suppressSpBfAfterPgBrk']),
+  ]);
   const marked = applyEmbeddedFontsDocx(spaced, fonts);
   if (isEmptyPageDecor(decor)) return patchPackedXml(orderDocxSettings(marked));
   const pt = (cm: number) => (cm / 2.54) * 72;

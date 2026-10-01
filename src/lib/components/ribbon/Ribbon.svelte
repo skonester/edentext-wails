@@ -20,8 +20,13 @@
   import BookmarkDialog from '../BookmarkDialog.svelte';
   import CrossRefDialog from '../CrossRefDialog.svelte';
   import FormulaDialog from '../FormulaDialog.svelte';
-  import { clickOutside, isMenuOpen, pinPanels, toggleMenu, closeMenu } from './menu.svelte';
-  import { t } from '../../i18n/i18n.svelte';
+  import CommandSearch from './CommandSearch.svelte';
+  import { clickOutside, isMenuOpen, pinPanels, toggleMenu, closeMenu, showMenu } from './menu.svelte';
+  import { CONTEXTUAL, RIBBON_COMMANDS, TABS, styleCommands, type RibbonCommand, type Tab } from './commands';
+  import { visibleStyles } from '../../styles/styleSheet';
+  import { showAllStyles, styleSheet } from '../../styles/sheet.svelte';
+  import { tick as settled } from 'svelte';
+  import { locale, t } from '../../i18n/i18n.svelte';
   import { withShortcut } from '../../i18n/shortcut';
   import { shortcutHint } from '../../editor/shortcuts';
   import { findTextBox } from '../../editor/extensions/textBox';
@@ -35,7 +40,7 @@
   import type { Orientation } from '../../storage/pageOrientation';
   import type { PageFormat } from '../../storage/pageFormat';
   import { DEFAULT_HF_DISTANCES, type HfDistances, type HfSet, type HfZone } from '../../storage/headerFooter';
-  import type { DocumentLanguage } from '../../storage/documentLanguage';
+  import { isAsianTag, tagForLanguage, type DocumentLanguage } from '../../storage/documentLanguage';
   import { DEFAULT_TAB_INTERVAL_CM } from '../../storage/tabInterval';
   import { DEFAULT_PAGE_NUMBERING, type PageNumbering } from '../../storage/pageNumbering';
   import { EMPTY_PAGE_DECOR, type PageDecor } from '../../storage/pageDecor';
@@ -54,6 +59,7 @@
     splitView = $bindable(false),
     pageColumns = $bindable(1),
     documentLanguage,
+    documentLanguageOther,
     onLanguage,
     zoom = 100,
     onZoom,
@@ -82,7 +88,7 @@
     onSelectTheme,
     pdfBusy = false,
     hasPassword = false,
-    onNew, onNewFromTemplate, onOpen, onSave, onSaveAs, onSaveTemplate, onExportPdf, onPrintPdf, onPrint, onAbout, onDocProperties, onProtect, onAutoCorrect, onAutoText, onNewComment,
+    onNew, onNewFromTemplate, onOpen, onSave, onSaveAs, onSaveTemplate, onExportPdf, onPrintPdf, onPrint, onAbout, onDocProperties, onBrowserDocuments, onProtect, onAutoCorrect, onAutoText, onNewComment,
     navigatorOpen = false, onToggleNavigator,
     recentFiles = [], onOpenRecent, onForgetRecent,
   }: {
@@ -98,6 +104,7 @@
     splitView?: boolean;
     pageColumns?: number;
     documentLanguage: DocumentLanguage;
+    documentLanguageOther: string | null;
     onLanguage: (code: DocumentLanguage) => void;
     zoom?: number;
     onZoom?: (value: number) => void;
@@ -139,6 +146,7 @@
     onPrint?: () => void;
     onAbout?: () => void;
     onDocProperties?: () => void;
+    onBrowserDocuments?: () => void;
     onProtect?: () => void;
     hasPassword?: boolean;
     onAutoCorrect?: () => void;
@@ -147,10 +155,6 @@
     navigatorOpen?: boolean;
     onToggleNavigator?: () => void;
   } = $props();
-
-  const TABS = ['home', 'insert', 'layout', 'references', 'review', 'view'] as const;
-  const CONTEXTUAL = ['tableDesign', 'tableLayout', 'pictureFormat', 'shapeFormat', 'headerFooter'] as const;
-  type Tab = (typeof TABS)[number] | (typeof CONTEXTUAL)[number];
 
   // Word opens on Home every time, so the active tab is not persisted.
   let tab = $state<Tab>('home');
@@ -209,10 +213,10 @@
 
   let hasSelection = $derived(tick >= 0 && !!editor && !editor.state.selection.empty);
   let isLink = $derived(tick >= 0 && !!editor?.isActive('link'));
-  let bmNames = $derived(tick >= 0 && editor && !hfActive ? bookmarkNames(editor.state.doc) : []);
+  let bmNames = $derived(tick >= 0 && editor ? bookmarkNames(editor.state.doc) : []);
 
   function openLink() {
-    if (!editor || hfActive) return; // body-only; the HF schema has no link mark
+    if (!editor) return;
     linkUrl = (editor.getAttributes('link').href as string) ?? '';
     linkOpen = true;
   }
@@ -238,13 +242,13 @@
   }
 
   function openBookmark() {
-    if (!editor || hfActive || !hasSelection) return;
+    if (!editor || !hasSelection) return;
     crossRefOpen = false;
     bookmarkOpen = true;
   }
 
   function openCrossRef() {
-    if (!editor || hfActive) return;
+    if (!editor) return;
     bookmarkOpen = false;
     crossRefOpen = true;
   }
@@ -300,10 +304,43 @@
     closeMenu();
     fn?.();
   }
+
+  // A hit opens its tab (or the File menu) and clicks the control itself, so the user
+  // sees where the command lives and a disabled one stays disabled.
+  const tabOf = (c: RibbonCommand) => (c.tab === null ? null : [c.tab].flat().find((x) => shown.includes(x)));
+  let searchable = $derived([
+    ...RIBBON_COMMANDS,
+    ...styleCommands(visibleStyles(styleSheet(), showAllStyles()).map((s) => s.name)),
+  ].filter((c) => c.tab === null || tabOf(c)));
+
+  // A colour split's own half applies the last colour; its palette is behind the chevron.
+  function act(id: string) {
+    const el = document.querySelector(`.ribbon [data-cmd="${CSS.escape(id)}"]`);
+    const target = el?.matches('button, input, select') ? el : el?.querySelector('.color-chevron') ?? el?.querySelector('button, input, select');
+    if (target instanceof HTMLSelectElement || (target instanceof HTMLInputElement && !['checkbox', 'radio'].includes(target.type))) {
+      target.focus();
+      if (target instanceof HTMLInputElement) target.select();
+    } else (target as HTMLElement | null | undefined)?.click();
+  }
+
+  async function runCommand(c: RibbonCommand) {
+    closeMenu();
+    const to = tabOf(c);
+    if (to) {
+      tab = to;
+      collapsed = false;
+    } else showMenu('file');
+    await settled();
+    if (c.via) {
+      act(c.via);
+      await settled();
+    }
+    act(c.id);
+  }
 </script>
 
 <div class="ribbon">
-  <div class="ribbon-tabs" class:strip-only={collapsed}>
+  <div class="ribbon-tabs" class:strip-only={collapsed} use:pinPanels>
     <div class="file-tab-wrap" use:clickOutside={'file'}>
       <button
         class="ribbon-tab-file"
@@ -316,37 +353,40 @@
       </button>
       {#if isMenuOpen('file')}
         <RibbonMenu minWidth={230}>
-          <button onclick={() => run(onNew)} disabled={!editor}>
+          <button data-cmd="newDocument" onclick={() => run(onNew)} disabled={!editor}>
             <Icon name="newDoc" size={16} />{t().app.newDocument}
           </button>
-          <button onclick={() => run(onNewFromTemplate)} disabled={!editor}>
+          <button data-cmd="newFromTemplate" onclick={() => run(onNewFromTemplate)} disabled={!editor}>
             <Icon name="foldMarks" size={16} />{t().templates.title}
           </button>
-          <button onclick={() => run(onOpen)} disabled={!editor}>
+          <button data-cmd="open" onclick={() => run(onOpen)} disabled={!editor}>
             <Icon name="folder" size={16} />{t().app.open}
             <span class="menu-key">{shortcutHint('open')}</span>
           </button>
+          <button data-cmd="browserDocuments" onclick={() => run(onBrowserDocuments)}>
+            <Icon name="folder" size={16} />{t().browserDocs.title}
+          </button>
           <hr />
-          <button onclick={() => run(onSave)} disabled={!editor || pdfBusy}>
+          <button data-cmd="save" onclick={() => run(onSave)} disabled={!editor || pdfBusy}>
             <Icon name="save" size={16} />{t().app.save}
             <span class="menu-key">{withShortcut('Ctrl+S')}</span>
           </button>
-          <button onclick={() => run(() => onSaveAs?.('odt'))} disabled={!editor || pdfBusy}>
+          <button data-cmd="saveAsOdt" onclick={() => run(() => onSaveAs?.('odt'))} disabled={!editor || pdfBusy}>
             <Icon name="save" size={16} />{t().ribbon.saveAs} (.odt)
           </button>
-          <button onclick={() => run(() => onSaveAs?.('docx'))} disabled={!editor || pdfBusy}>
+          <button data-cmd="saveAsDocx" onclick={() => run(() => onSaveAs?.('docx'))} disabled={!editor || pdfBusy}>
             <Icon name="save" size={16} />{t().ribbon.saveAs} (.docx)
           </button>
           <hr />
-          <button onclick={() => run(onExportPdf)} disabled={pdfBusy}>
+          <button data-cmd="rasterPdf" onclick={() => run(onExportPdf)} disabled={pdfBusy}>
             <Icon name="export" size={16} />{pdfBusy ? t().app.exporting : t().app.rasterPdf}
             <span class="menu-sub">{t().app.rasterHint}</span>
           </button>
-          <button onclick={() => run(onPrintPdf)}>
+          <button data-cmd="vectorPdf" onclick={() => run(onPrintPdf)}>
             <Icon name="export" size={16} />{t().app.vectorPdf}
             <span class="menu-sub">{t().app.vectorHint}</span>
           </button>
-          <button onclick={() => run(onSaveTemplate)}>
+          <button data-cmd="saveTemplate" onclick={() => run(onSaveTemplate)}>
             <Icon name="export" size={16} />{t().app.template}
             <span class="menu-sub">{t().app.templateHint}</span>
           </button>
@@ -362,18 +402,18 @@
             </button>
           {/if}
           <hr />
-          <button onclick={() => run(onPrint)} disabled={!editor || pdfBusy}>
+          <button data-cmd="print" onclick={() => run(onPrint)} disabled={!editor || pdfBusy}>
             <Icon name="print" size={16} />{t().app.print}
             <span class="menu-key">{withShortcut('Ctrl+P')}</span>
           </button>
-          <button onclick={() => run(onProtect)}>
+          <button data-cmd="protect" onclick={() => run(onProtect)}>
             <Icon name="lock" size={16} />{t().password.menu}
             {#if hasPassword}<span class="menu-key">{t().password.menuOn}</span>{/if}
           </button>
-          <button onclick={() => run(onDocProperties)}>
+          <button data-cmd="docProperties" onclick={() => run(onDocProperties)}>
             <Icon name="info" size={16} />{t().docProps.title}
           </button>
-          <button onclick={() => run(onAbout)}>
+          <button data-cmd="about" onclick={() => run(onAbout)}>
             <Icon name="info" size={16} />{t().about.label}
           </button>
         </RibbonMenu>
@@ -401,6 +441,8 @@
 
     <span class="ribbon-tabs-spacer"></span>
 
+    <CommandSearch commands={searchable} onRun={runCommand} onCancel={() => editor?.commands.focus()} />
+
     <div class="doc-name">
       <span class="doc-name-sizer" aria-hidden="true" bind:clientWidth={docNameSizerWidth}>{documentName || namePlaceholder}</span>
       <input
@@ -415,8 +457,8 @@
       />
       <span class="doc-name-ext">.{documentFormat}</span>
     </div>
-    <!-- Beside the name, not inside it: the name box is capped at 30% of the strip,
-         and the label would take that width off the name itself. -->
+    <!-- Beside the name, not inside it: the name box is capped at 16rem, and the
+         label would take that width off the name itself. -->
     {#if dirty}<span class="doc-dirty">• {t().app.unsavedChanges}</span>{/if}
 
     <!-- Word puts this chevron in the band's corner. It rides the strip so the band
@@ -475,7 +517,7 @@
   {#if !collapsed}
   <div class="ribbon-body" use:pinPanels>
     {#if tab === 'home'}
-      <HomeTab {editor} {tick} bind:showFormattingMarks {onManageStyles} {onFind} onParagraphDialog={() => (paragraphDialogOpen = true)} />
+      <HomeTab {editor} {tick} asianDocument={isAsianTag(tagForLanguage(documentLanguage) ?? '') || isAsianTag(locale())} bind:showFormattingMarks {onManageStyles} {onFind} onParagraphDialog={() => (paragraphDialogOpen = true)} />
     {:else if tab === 'insert'}
       <InsertTab {editor} {tick} {hfActive} {pageMargins} {pageOrientation} {pageFormat} bind:hfDistances bind:differentFirstPage bind:differentOddEven {onEditZone} {onManageTableStyles} {onAutoText} />
     {:else if tab === 'layout'}
@@ -483,7 +525,7 @@
     {:else if tab === 'references'}
       <ReferencesTab {editor} {tick} {hfActive} {onNoteOptions} />
     {:else if tab === 'review'}
-      <ReviewTab {editor} {tick} {documentLanguage} {onLanguage} {onAutoCorrect} {onNewComment} />
+      <ReviewTab {editor} {tick} {documentLanguage} {documentLanguageOther} {onLanguage} {onAutoCorrect} {onNewComment} />
     {:else if tab === 'view'}
       <ViewTab bind:showRuler bind:showFormattingMarks bind:showFieldShading bind:splitView bind:pageColumns {zoom} {onZoom} {onDebugDump} {navigatorOpen} {onToggleNavigator} />
     {:else if tab === 'headerFooter'}
@@ -575,20 +617,24 @@
 
   .ribbon :global(.bp-trigger) { height: 30px; }
 
-  /* Wraps once the tabs, the name and the chrome buttons stop fitting. It cannot
-     scroll like the band does: the File and appearance menus drop from inside it,
-     and a scroll container would clip them. */
+  /* Scrolls sideways once the tabs, the name and the chrome buttons stop fitting.
+     Its menus are pinned `position: fixed` (`anchored`, `pinPanels`), so the scroll
+     container does not clip them. */
   .ribbon-tabs {
     display: flex;
-    flex-wrap: wrap;
     align-items: center;
     gap: 2px;
-    padding: 3px 10px 0;
+    padding: 3px 10px 2.5px;
+    margin-bottom: -2.5px;
+    overflow-x: auto;
+    scrollbar-width: none;
   }
+  .ribbon-tabs > :global(*) { flex-shrink: 0; }
 
-  /* The active tab's underline hangs below its box, onto the band. Collapsed there
-     is no band, so the strip lends it the room instead of the bottom border. */
-  .ribbon-tabs.strip-only { padding-bottom: 5px; }
+  /* The active tab's underline hangs below its box, onto the band: the padding keeps
+     it inside the scroller, the negative margin lays it over the band's top edge.
+     Collapsed there is no band, so the strip keeps the room. */
+  .ribbon-tabs.strip-only { padding-bottom: 5px; margin-bottom: 0; }
 
   .ribbon-tab {
     position: relative;
@@ -699,10 +745,12 @@
 
   /* The name field grows with its text: the sizer mirrors the value and lends the
      input its width. */
+  /* Anchors the hidden sizer here: placed against the page, it widened a phone's
+     layout viewport and pushed centred dialogs off screen. */
   .doc-name {
+    position: relative;
     display: inline-flex;
     align-items: center;
-    max-width: 30%;
     color: var(--w-text-dim);
     font-size: 12px;
   }
@@ -726,6 +774,7 @@
     font: inherit;
     font-size: 12px;
     text-align: right;
+    text-overflow: ellipsis;
   }
 
   .doc-name-input:hover { border-color: var(--w-border-strong); }

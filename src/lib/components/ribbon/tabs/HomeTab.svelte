@@ -9,7 +9,7 @@
   import ColorPicker from '../../ColorPicker.svelte';
   import ParagraphBorderPicker from '../../ParagraphBorderPicker.svelte';
   import { anchored, clickOutside, isMenuOpen, toggleMenu, closeMenu } from '../menu.svelte';
-  import { uniformMarkColor, uniformBlockAttr } from '../../../utils/selectionFormat';
+  import { uniformMarkColor, uniformBlockAttr, hasAsianLanguage } from '../../../utils/selectionFormat';
   import { stepFontSize } from '../../../editor/extensions/shortcuts';
 
   import { clipboardCommand, readClipboard } from '../../../editor/contextMenuItems';
@@ -21,15 +21,16 @@
   import { isInHeaderCell } from '../../../editor/extensions/tableHeaderRow';
   import { cellRegionText } from '../../../editor/extensions/tableStyle';
   import { styleSheet } from '../../../styles/sheet.svelte';
-  import type { CapsMode, LineStyle } from '../../../editor/extensions/textEffects';
+  import { emphasisCss, type CapsMode, type Emphasis, type LineStyle } from '../../../editor/extensions/textEffects';
   import type { StyleFamily } from '../../../styles/styleSheet';
-  import { t } from '../../../i18n/i18n.svelte';
+  import { styleLabel, t } from '../../../i18n/i18n.svelte';
   import { withShortcut } from '../../../i18n/shortcut';
   import { shortcutHint, type ShortcutId } from '../../../editor/shortcuts';
 
-  let { editor, tick, showFormattingMarks = $bindable(false), onManageStyles, onFind, onParagraphDialog }: {
+  let { editor, tick, showFormattingMarks = $bindable(false), onManageStyles, onFind, onParagraphDialog, asianDocument = false }: {
     editor: Editor | null;
     tick: number;
+    asianDocument?: boolean;
     showFormattingMarks?: boolean;
     onManageStyles?: (family: StyleFamily) => void;
     onFind?: (mode: 'find' | 'replace') => void;
@@ -59,6 +60,8 @@
   let isItalic = $derived(tick >= 0 && !!editor?.isActive('italic'));
   let isUnderline = $derived(tick >= 0 && !!editor?.isActive('underline'));
   let isStrike = $derived(tick >= 0 && !!editor?.isActive('strike'));
+  let asianSelection = $derived(tick >= 0 && !!editor && hasAsianLanguage(editor.state));
+  let emphasis = $derived(tick >= 0 ? editor?.getAttributes('textStyle').emphasis ?? null : null);
   let isSuper = $derived(tick >= 0 && !!editor?.isActive('superscript'));
   let isSub = $derived(tick >= 0 && !!editor?.isActive('subscript'));
   let isBulletList = $derived(tick >= 0 && !!editor?.isActive('bulletList'));
@@ -94,13 +97,34 @@
 
   const LINE_STYLES: LineStyle[] = ['solid', 'double', 'dotted', 'dashed', 'wavy'];
 
+  // Chinese sets its emphasis dots below the characters, so that is the button's own.
+  const EMPHASES: { mode: Emphasis | null; key: 'none' | 'dotBelow' | 'dotAbove' | 'circle' | 'disc' | 'accent' }[] = [
+    { mode: null, key: 'none' },
+    { mode: 'dot below', key: 'dotBelow' },
+    { mode: 'dot above', key: 'dotAbove' },
+    { mode: 'circle above', key: 'circle' },
+    { mode: 'disc above', key: 'disc' },
+    { mode: 'accent above', key: 'accent' },
+  ];
+
+  function setEmphasis(mode: Emphasis | null) {
+    closeMenu();
+    editor?.chain().focus().setMark('textStyle', { emphasis: mode }).run();
+  }
+
   // The mark has to exist before its line style means anything, so turn it on too.
   function setLineStyle(mark: 'underline' | 'strike', style: LineStyle) {
     closeMenu();
     if (!editor) return;
     const chain = editor.chain().focus();
-    if (!editor.isActive(mark)) chain.setMark(mark);
-    chain.updateAttributes(mark, { lineStyle: style }).run();
+    // A bare caret inside a line restyles that whole run, not just the next typed text.
+    // With no run to extend over (an empty line) the mark is only stored, and moving
+    // the selection would drop it.
+    const caret = editor.state.selection.empty && editor.isActive(mark) ? editor.state.selection.from : null;
+    if (caret !== null) chain.extendMarkRange(mark);
+    chain.setMark(mark, { lineStyle: style });
+    if (caret !== null) chain.command(({ tr, commands }) => tr.selection.empty || commands.setTextSelection(caret));
+    chain.run();
   }
 
   // Inside a list Tab/Shift-Tab nest instead of shifting the paragraph's indent.
@@ -187,6 +211,7 @@
     <RibbonButton
       variant="big"
       icon="paste"
+      cmd="paste"
       label={t().contextMenu.paste}
       title={`${t().contextMenu.paste} (${withShortcut('Ctrl+V')})`}
       disabled={!editor}
@@ -201,15 +226,15 @@
         <button onclick={() => paste(false)}>
           {t().contextMenu.paste}<span class="menu-key">{withShortcut('Ctrl+V')}</span>
         </button>
-        <button onclick={() => paste(true)}>
+        <button data-cmd="pastePlain" onclick={() => paste(true)}>
           {t().contextMenu.pasteWithoutFormatting}<span class="menu-key">{withShortcut('Ctrl+Shift+V')}</span>
         </button>
       </div>
     {/if}
   </div>
   <div class="rb-col">
-    <RibbonButton variant="small" icon="cut" label={t().contextMenu.cut} title={`${t().contextMenu.cut} (${withShortcut('Ctrl+X')})`} disabled={!hasSelection} onclick={() => editor && clipboardCommand(editor, 'cut')} />
-    <RibbonButton variant="small" icon="copy" label={t().contextMenu.copy} title={`${t().contextMenu.copy} (${withShortcut('Ctrl+C')})`} disabled={!hasSelection} onclick={() => editor && clipboardCommand(editor, 'copy')} />
+    <RibbonButton variant="small" icon="cut" cmd="cut" label={t().contextMenu.cut} title={`${t().contextMenu.cut} (${withShortcut('Ctrl+X')})`} disabled={!hasSelection} onclick={() => editor && clipboardCommand(editor, 'cut')} />
+    <RibbonButton variant="small" icon="copy" cmd="copy" label={t().contextMenu.copy} title={`${t().contextMenu.copy} (${withShortcut('Ctrl+C')})`} disabled={!hasSelection} onclick={() => editor && clipboardCommand(editor, 'copy')} />
   </div>
 </RibbonGroup>
 
@@ -218,26 +243,26 @@
 <RibbonGroup label={t().ribbon.groups.font}>
   <div class="rb-rows">
     <div class="rb-row">
-      <FontFamilyBox {editor} {tick} />
-      <FontSizeBox {editor} {tick} />
-      <RibbonButton title={t().toolbarExpanded.growFont} content={growIcon} onclick={() => editor && stepFontSize(editor, 1)} />
-      <RibbonButton title={t().toolbarExpanded.shrinkFont} content={shrinkIcon} onclick={() => editor && stepFontSize(editor, -1)} />
+      <span class="rb-cmd" data-cmd="fontFamily"><FontFamilyBox {editor} {tick} /></span>
+      <span class="rb-cmd" data-cmd="fontSize"><FontSizeBox {editor} {tick} /></span>
+      <RibbonButton cmd="growFont" title={t().toolbarExpanded.growFont} content={growIcon} onclick={() => editor && stepFontSize(editor, 1)} />
+      <RibbonButton cmd="shrinkFont" title={t().toolbarExpanded.shrinkFont} content={shrinkIcon} onclick={() => editor && stepFontSize(editor, -1)} />
       <div class="rb-menu-wrap" use:clickOutside={'case'}>
-        <RibbonButton icon="changeCase" title={t().ribbon.case.title} active={isMenuOpen('case')} caret onclick={() => toggleMenu('case')} />
+        <RibbonButton cmd="changeCase" icon="changeCase" title={t().ribbon.case.title} active={isMenuOpen('case')} caret onclick={() => toggleMenu('case')} />
         {#if isMenuOpen('case')}
           <div class="ribbon-menu" use:anchored role="menu">
             {#each CASES as c}
-              <button onclick={() => setCase(c.mode)}>{c.label}</button>
+              <button data-cmd={`case-${c.mode ?? 'none'}`} onclick={() => setCase(c.mode)}>{c.label}</button>
             {/each}
           </div>
         {/if}
       </div>
     </div>
     <div class="rb-row">
-      <RibbonButton content={boldIcon} title={`${t().toolbar.bold} (${withShortcut('Ctrl+B')})`} active={isBold} onclick={toggleBold} />
-      <RibbonButton content={italicIcon} title={`${t().toolbar.italic} (${withShortcut('Ctrl+I')})`} active={isItalic} onclick={() => editor?.chain().focus().toggleItalic().run()} />
+      <RibbonButton cmd="bold" content={boldIcon} title={`${t().toolbar.bold} (${withShortcut('Ctrl+B')})`} active={isBold} onclick={toggleBold} />
+      <RibbonButton cmd="italic" content={italicIcon} title={`${t().toolbar.italic} (${withShortcut('Ctrl+I')})`} active={isItalic} onclick={() => editor?.chain().focus().toggleItalic().run()} />
       <div class="rb-menu-wrap" use:clickOutside={'underline'}>
-        <RibbonButton content={underlineIcon} title={`${t().toolbar.underline} (${withShortcut('Ctrl+U')})`} active={isUnderline} caret caretActive={isMenuOpen('underline')} onclick={() => editor?.chain().focus().toggleUnderline().run()} onCaret={() => toggleMenu('underline')} />
+        <RibbonButton cmd="underline" content={underlineIcon} title={`${t().toolbar.underline} (${withShortcut('Ctrl+U')})`} active={isUnderline} caret caretActive={isMenuOpen('underline')} onclick={() => editor?.chain().focus().toggleUnderline().run()} onCaret={() => toggleMenu('underline')} />
         {#if isMenuOpen('underline')}
           <div class="ribbon-menu line-menu" use:anchored role="menu">
             {#each LINE_STYLES as s}
@@ -249,7 +274,7 @@
         {/if}
       </div>
       <div class="rb-menu-wrap" use:clickOutside={'strike'}>
-        <RibbonButton content={strikeIcon} title={`${t().toolbar.strikethrough} (${withShortcut('Ctrl+Shift+S')})`} active={isStrike} caret caretActive={isMenuOpen('strike')} onclick={() => editor?.chain().focus().toggleStrike().run()} onCaret={() => toggleMenu('strike')} />
+        <RibbonButton cmd="strike" content={strikeIcon} title={`${t().toolbar.strikethrough} (${withShortcut('Ctrl+Shift+S')})`} active={isStrike} caret caretActive={isMenuOpen('strike')} onclick={() => editor?.chain().focus().toggleStrike().run()} onCaret={() => toggleMenu('strike')} />
         {#if isMenuOpen('strike')}
           <div class="ribbon-menu line-menu" use:anchored role="menu">
             {#each LINE_STYLES as s}
@@ -260,10 +285,25 @@
           </div>
         {/if}
       </div>
-      <RibbonButton content={subIcon} title={`${t().toolbarExpanded.subscript} (${shortcutHint('subscript')})`} active={isSub} onclick={toggleSub} />
-      <RibbonButton content={superIcon} title={`${t().toolbarExpanded.superscript} (${shortcutHint('superscript')})`} active={isSuper} onclick={toggleSuper} />
+      <!-- East Asian typography only (document, UI or selected text language); a mark already in the text keeps the button to clear it. -->
+      {#if asianDocument || asianSelection || emphasis}
+      <div class="rb-menu-wrap" use:clickOutside={'emphasis'}>
+        <RibbonButton cmd="emphasis" content={emphasisIcon} title={t().ribbon.emphasis.title} active={!!emphasis} caret caretActive={isMenuOpen('emphasis')} onclick={() => editor?.chain().focus().setMark('textStyle', { emphasis: emphasis ? null : 'dot below' }).run()} onCaret={() => toggleMenu('emphasis')} />
+        {#if isMenuOpen('emphasis')}
+          <div class="ribbon-menu line-menu" use:anchored role="menu">
+            {#each EMPHASES as e}
+              <button onclick={() => setEmphasis(e.mode)}>
+                <span class="line-sample" style={e.mode ? emphasisCss(e.mode) : null}>{t().ribbon.emphasis[e.key]}</span>
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </div>
+      {/if}
+      <RibbonButton cmd="subscript" content={subIcon} title={`${t().toolbarExpanded.subscript} (${shortcutHint('subscript')})`} active={isSub} onclick={toggleSub} />
+      <RibbonButton cmd="superscript" content={superIcon} title={`${t().toolbarExpanded.superscript} (${shortcutHint('superscript')})`} active={isSuper} onclick={toggleSuper} />
       <span class="rb-mini-sep"></span>
-      <ColorPicker
+      <span class="rb-cmd" data-cmd="highlight"><ColorPicker
         {editor}
         currentColor={highlight}
         defaultColor="#FFFF00"
@@ -273,8 +313,8 @@
         onApply={(c, r) => editor?.chain().focus().setTextSelection(r).setHighlight({ color: c }).run()}
         onClear={(r) => editor?.chain().focus().setTextSelection(r).unsetHighlight().run()}
         icon={highlightIcon}
-      />
-      <ColorPicker
+      /></span>
+      <span class="rb-cmd" data-cmd="fontColor"><ColorPicker
         {editor}
         currentColor={fontColor}
         defaultColor="#C00000"
@@ -283,8 +323,8 @@
         onApply={(c, r) => editor?.chain().focus().setTextSelection(r).setColor(c).run()}
         onClear={(r) => editor?.chain().focus().setTextSelection(r).unsetColor().run()}
         icon={fontColorIcon}
-      />
-      <RibbonButton icon="clearFormat" title={`${t().toolbarExpanded.clearFormatting} (${shortcutHint('clearFormatting')})`} onclick={() => editor?.commands.clearDirectFormatting()} />
+      /></span>
+      <RibbonButton cmd="clearFormatting" icon="clearFormat" title={`${t().toolbarExpanded.clearFormatting} (${shortcutHint('clearFormatting')})`} onclick={() => editor?.commands.clearDirectFormatting()} />
     </div>
   </div>
 </RibbonGroup>
@@ -295,7 +335,7 @@
   <div class="rb-rows">
     <div class="rb-row">
       <div class="rb-menu-wrap" use:clickOutside={'bullets'}>
-        <RibbonButton icon="bulletList" title={t().toolbar.bulletList} active={isBulletList} caret caretActive={isMenuOpen('bullets')} onclick={() => editor?.chain().focus().toggleBulletList().run()} onCaret={() => toggleMenu('bullets')} />
+        <RibbonButton cmd="bulletList" icon="bulletList" title={t().toolbar.bulletList} active={isBulletList} caret caretActive={isMenuOpen('bullets')} onclick={() => editor?.chain().focus().toggleBulletList().run()} onCaret={() => toggleMenu('bullets')} />
         {#if isMenuOpen('bullets')}
           <div class="ribbon-menu bullet-menu" use:anchored role="menu">
             <div class="rb-menu-label">{t().toolbar.bulletSymbol}</div>
@@ -311,7 +351,7 @@
               <div class="rb-menu-label">{t().styles.listStyles}</div>
               {#each bulletListStyles as s (s.name)}
                 <button class:selected={currentListStyle === s.name} onclick={() => applyListStyle(s, 'bulletList')}>
-                  <span class="marker">{listStylePreview(s)}</span>{s.name}
+                  <span class="marker">{listStylePreview(s)}</span>{styleLabel(s.name)}
                 </button>
               {/each}
             {/if}
@@ -320,7 +360,7 @@
         {/if}
       </div>
       <div class="rb-menu-wrap" use:clickOutside={'numbering'}>
-        <RibbonButton icon="orderedList" title={t().toolbar.orderedList} active={isOrderedList} caret caretActive={isMenuOpen('numbering')} onclick={() => editor?.chain().focus().toggleOrderedList().run()} onCaret={() => toggleMenu('numbering')} />
+        <RibbonButton cmd="orderedList" icon="orderedList" title={t().toolbar.orderedList} active={isOrderedList} caret caretActive={isMenuOpen('numbering')} onclick={() => editor?.chain().focus().toggleOrderedList().run()} onCaret={() => toggleMenu('numbering')} />
         {#if isMenuOpen('numbering')}
           <div class="ribbon-menu" use:anchored role="menu">
             <div class="rb-menu-label">{t().toolbar.numbering}</div>
@@ -333,7 +373,7 @@
               <div class="rb-menu-label">{t().styles.listStyles}</div>
               {#each orderedListStyles as s (s.name)}
                 <button class:selected={currentListStyle === s.name} onclick={() => applyListStyle(s, 'orderedList')}>
-                  <span class="marker">{listStylePreview(s)}</span>{s.name}
+                  <span class="marker">{listStylePreview(s)}</span>{styleLabel(s.name)}
                 </button>
               {/each}
             {/if}
@@ -342,14 +382,15 @@
         {/if}
       </div>
       <span class="rb-mini-sep"></span>
-      <RibbonButton icon="indentLess" title={t().toolbarExpanded.decreaseIndent} onclick={() => changeIndent(-1)} />
-      <RibbonButton icon="indentMore" title={t().toolbarExpanded.increaseIndent} onclick={() => changeIndent(1)} />
+      <RibbonButton cmd="indentLess" icon="indentLess" title={t().toolbarExpanded.decreaseIndent} onclick={() => changeIndent(-1)} />
+      <RibbonButton cmd="indentMore" icon="indentMore" title={t().toolbarExpanded.increaseIndent} onclick={() => changeIndent(1)} />
       <span class="rb-mini-sep"></span>
-      <RibbonButton icon="pilcrow" title={`${t().toolbarExpanded.formattingMarks} (${shortcutHint('formattingMarks')})`} active={showFormattingMarks} onclick={() => (showFormattingMarks = !showFormattingMarks)} />
+      <RibbonButton cmd="formattingMarks" icon="pilcrow" title={`${t().toolbarExpanded.formattingMarks} (${shortcutHint('formattingMarks')})`} active={showFormattingMarks} onclick={() => (showFormattingMarks = !showFormattingMarks)} />
     </div>
     <div class="rb-row">
       {#each (['left', 'center', 'right', 'justify'] as const) as a}
         <RibbonButton
+          cmd={`align-${a}`}
           icon={a === 'left' ? 'alignLeft' : a === 'center' ? 'alignCenter' : a === 'right' ? 'alignRight' : 'alignJustify'}
           title={`${t().align.alignTo(t().align[a])} (${shortcutHint(`align${a[0].toUpperCase()}${a.slice(1)}` as ShortcutId)})`}
           active={align === a}
@@ -357,7 +398,7 @@
         />
       {/each}
       <div class="rb-menu-wrap" use:clickOutside={'lineHeight'}>
-        <RibbonButton icon="lineSpacing" title={t().toolbarExpanded.lineSpacing} caret active={isMenuOpen('lineHeight')} onclick={() => toggleMenu('lineHeight')} />
+        <RibbonButton cmd="lineSpacing" icon="lineSpacing" title={t().toolbarExpanded.lineSpacing} caret active={isMenuOpen('lineHeight')} onclick={() => toggleMenu('lineHeight')} />
         {#if isMenuOpen('lineHeight')}
           <div class="ribbon-menu" use:anchored role="menu">
             {#each LINE_HEIGHTS as h}
@@ -370,7 +411,7 @@
         {/if}
       </div>
       <span class="rb-mini-sep"></span>
-      <ColorPicker
+      <span class="rb-cmd" data-cmd="paragraphShading"><ColorPicker
         {editor}
         currentColor={paraShade}
         defaultColor="#D9D9D9"
@@ -380,8 +421,8 @@
         onApply={(c, r) => editor?.chain().focus().setTextSelection(r).setParagraphBackground(c).run()}
         onClear={(r) => editor?.chain().focus().setTextSelection(r).setParagraphBackground(null).run()}
         icon={shadingIcon}
-      />
-      <ParagraphBorderPicker {editor} {tick} />
+      /></span>
+      <span class="rb-cmd" data-cmd="paragraphBorders"><ParagraphBorderPicker {editor} {tick} /></span>
     </div>
   </div>
 </RibbonGroup>
@@ -396,15 +437,16 @@
 
 <RibbonGroup label={t().ribbon.groups.editing}>
   <div class="rb-col">
-    <RibbonButton variant="small" icon="find" label={t().ribbon.find} title={`${t().ribbon.find} (${shortcutHint('find')})`} onclick={() => onFind?.('find')} />
-    <RibbonButton variant="small" icon="replace" label={t().ribbon.replace} title={`${t().ribbon.replace} (${shortcutHint('replace')})`} onclick={() => onFind?.('replace')} />
+    <RibbonButton variant="small" icon="find" cmd="find" label={t().ribbon.find} title={`${t().ribbon.find} (${shortcutHint('find')})`} onclick={() => onFind?.('find')} />
+    <RibbonButton variant="small" icon="replace" cmd="replace" label={t().ribbon.replace} title={`${t().ribbon.replace} (${shortcutHint('replace')})`} onclick={() => onFind?.('replace')} />
   </div>
 </RibbonGroup>
 
-{#snippet boldIcon()}<span class="glyph" style="font-weight: 800">B</span>{/snippet}
-{#snippet italicIcon()}<span class="glyph" style="font-style: italic; font-family: serif">I</span>{/snippet}
-{#snippet underlineIcon()}<span class="glyph" style="text-decoration: underline">U</span>{/snippet}
-{#snippet strikeIcon()}<span class="glyph" style="text-decoration: line-through">S</span>{/snippet}
+{#snippet boldIcon()}<span class="glyph" style="font-weight: 800">{t().toolbar.glyphs.bold}</span>{/snippet}
+{#snippet italicIcon()}<span class="glyph" style="font-style: italic; font-family: serif">{t().toolbar.glyphs.italic}</span>{/snippet}
+{#snippet underlineIcon()}<span class="glyph" style="text-decoration: underline">{t().toolbar.glyphs.underline}</span>{/snippet}
+{#snippet emphasisIcon()}<span class="glyph" style="text-emphasis: filled dot; text-emphasis-position: under right">文</span>{/snippet}
+{#snippet strikeIcon()}<span class="glyph" style="text-decoration: line-through">ab</span>{/snippet}
 {#snippet subIcon()}<span class="glyph">X<span class="glyph-script down">2</span></span>{/snippet}
 {#snippet superIcon()}<span class="glyph">X<span class="glyph-script up">2</span></span>{/snippet}
 {#snippet growIcon()}<span class="glyph">A<span class="glyph-sup">▲</span></span>{/snippet}

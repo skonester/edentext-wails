@@ -29,6 +29,8 @@ Zoom is `transform: scale()` on `.paper`; pagination always measures unscaled ge
 `.paper-scaler` reserves the transformed footprint for centering and scrollbars. `App.svelte`'s
 `setZoom` is the sole writer and persists the clamped range. Pointer zoom preserves the point
 under the cursor; keyboard, buttons, and slider preserve the viewport anchor.
+A two-finger pinch over `.editor` is the same zoom, anchored between the fingers;
+`touch-action: pan-x pan-y` keeps the browser from scaling the whole app there.
 
 Keep `pageBreaks.ts`, `Editor.svelte`, and `editor.css` page constants aligned. Section paper
 dimensions remain unrounded: pagination uses the published value directly and cumulative
@@ -56,6 +58,13 @@ mutually exclusive.
 
 - One scroller carries the canvas and defines the coordinate space for floating layers.
 - The focused view must be the cell displaying the caret's page; other cells clip it away.
+  Cells clip with `overflow: clip` (a hidden box still scrolls to a caret it clips), and an
+  empty slot hides by opacity (a `visibility: hidden` cell drops the focus when rows re-aim).
+- Neither ProseMirror nor the browser scrolls the caret into view: the drawing view may clip
+  that page. `followCaret` scrolls to the caret in its page's cell, measured where the DOM
+  selection draws it (flushed into the state first: fast arrow keys run it ahead), and runs
+  again after each layout change. PageDown/PageUp keep the caret's
+  spot on the neighbouring page (`gridPageStep`).
 - A pane may dispatch only document, selection, or stored-mark changes caused by its user.
   Viewport-derived plugin state otherwise makes shared panes transact against each other.
 - Move the primary editor view to the first host when the layout changes rather than rebuilding
@@ -63,9 +72,24 @@ mutually exclusive.
 
 ## Header and footer
 
-Headers and footers are independent single-paragraph TipTap documents. One live zone editor
-serves the active zone; inactive zones render static HTML. Their typography inherits the
-document default paragraph style, not the editor fallback.
+Headers and footers are independent TipTap documents in the body's schema minus the page
+flow (`zoneExtensions()`): paragraphs, lists, tables, pictures and text boxes. One live zone
+editor serves the active zone. An inactive zone is a clone of a read-only editor per set and
+zone, mounted in the off-screen measuring box, so NodeViews and decorations (list markers,
+table columns, frames) render as they do live; the page's fields and tabs are laid out on each
+clone. Their typography inherits the document default paragraph style, not the editor
+fallback. While one is open, the floating table/image/text-box toolbars and the context menu
+serve its editor (`uiEditor`), and only the body dims.
+
+A frame in a zone flows there when it wraps (side or band) and stays out of the zone's height
+when it runs through. One placed against the page is placed by CSS from the zone box:
+`--page-x`/`--page-y` from the node view against the zone's `--hf-page-y`, so the zone's editor
+and that paragraph take no position of their own. One placed against the body's top
+(`wrapFromBody`) is placed from `--hf-body-y`, where that page's body begins; a wrapping one
+there pushes the body down past it (`zoneIntrusions` → Editor.svelte's reaches), since
+LibreOffice leaves less than 2cm beside it empty. Only header frames are measured, and the
+whole body top moves, not just the lines beside the frame. Frames behind the text paint from a second
+clone of the zone in `.hf-bg-layer`, which shows only them; the open zone shows them all.
 
 Zones live inside scaled `.paper` but use unscaled document coordinates. Page fields are
 patched per page. Keep only a window near the current page for normal editing, then expand it

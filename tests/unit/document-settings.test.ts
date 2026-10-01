@@ -1,6 +1,6 @@
-// Everything a save carries besides the document tree: the app hands the exporters
-// nineteen arguments, and the corpus legs pass seven. This is the other twelve — set to
-// non-default values and read back out of both formats.
+// Everything a save carries besides the document tree: the arguments the app hands the
+// exporters past the seven the corpus legs pass — set to non-default values and read back
+// out of both formats (embedded fonts and the line grid have tests of their own).
 import { describe, it, expect } from 'vitest';
 import { buildOdt } from '../../src/lib/export/odt';
 import { importOdt } from '../../src/lib/import/odt';
@@ -37,7 +37,7 @@ const lineNumbering = { on: true, interval: 3, distanceCm: 0.8, restart: 'page' 
 
 const args = [margins, 'landscape', hf, { language: 'de', country: 'DE' }, 'letter', builtinStyleSheet(),
   1.11, 'max', true, notes, props, true, { format: 'i' as const, start: 7 }, decor, lineNumbering,
-  true, true, false] as const;
+  true, true, false, [], { on: false, pitchPt: 15.6 }, true] as const;
 
 // A zone's text alone: the upper-case letters of its serialized tree.
 const zoneText = (z: N) => (z ? JSON.stringify(z).replace(/[^A-Z]/g, '') : null);
@@ -64,7 +64,7 @@ describe.each([['ODT', buildOdt, importOdt], ['DOCX', buildDocx, importDocx]] as
     it('keeps the flow settings', async () => {
       const r = await roundTrip();
       expect(r.tabIntervalCm).toBe(1.11);
-      expect([r.spacingModel, r.spacingAtPageStart]).toEqual(['max', false]);
+      expect([r.spacingModel, r.spacingAtPageStart, r.balanceSpaces]).toEqual(['max', false, true]);
       expect([r.hyphenate, r.recordChanges, r.foldMarks]).toEqual([true, true, true]);
       expect(r.pageNumbering).toEqual({ format: 'i', start: 7 });
       expect(r.lineNumbering).toEqual(lineNumbering);

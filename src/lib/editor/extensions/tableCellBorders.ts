@@ -228,8 +228,9 @@ export const TableCellBorders = Extension.create({
                 if (!css) return {};
                 // Only the bottom one: with border-collapse a boundary draws a single
                 // line, so compensating both sides of it would take the excess twice.
-                const over = side === 'borderBottom' ? borderOvershootPx(v) : 0;
-                const style = `${SIDE_META[side].css}: ${css}` + (over ? `; --border-over: ${over}px` : '');
+                // Always set, since the CSS fallback is the default line's excess.
+                const style = `${SIDE_META[side].css}: ${css}` +
+                  (side === 'borderBottom' ? `; --border-over: ${borderOvershootPx(v)}px` : '');
                 return { [SIDE_META[side].data]: v, style };
               },
             },

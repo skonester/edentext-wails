@@ -1,6 +1,6 @@
-// The document's spell-check language. One value per document, persisted to
-// localStorage and round-tripped through the .odt (fo:language/fo:country on
-// the default paragraph style). 'none' disables checking.
+// The document's language: a main one, persisted to localStorage and round-tripped
+// through the default paragraph style, plus the other slot's tag (western or asian).
+// 'none' disables checking.
 
 import { resolveBrowserLocale } from '../i18n/config';
 import { docKey } from './docScope';
@@ -33,11 +33,13 @@ export const LANGUAGES: LanguageDef[] = [
   { code: 'fr', label: 'Français', odf: { language: 'fr', country: 'FR' } },
   { code: 'pt', label: 'Português (Portugal)', odf: { language: 'pt', country: 'PT' } },
   { code: 'ru', label: 'Русский', odf: { language: 'ru', country: 'RU' } },
+  { code: 'ja-JP', label: '日本語', odf: { language: 'ja', country: 'JP' }, noDict: true },
   { code: 'zh-CN', label: '中文（简体）', odf: { language: 'zh', country: 'CN' }, noDict: true },
   { code: 'zh-TW', label: '中文（繁體）', odf: { language: 'zh', country: 'TW' }, noDict: true },
 ];
 
 const KEY = docKey('edentext-doc-language');
+const OTHER_KEY = docKey('edentext-doc-language-other');
 
 export function findLanguage(code: DocumentLanguage): LanguageDef | undefined {
   return LANGUAGES.find((l) => l.code === code);
@@ -60,6 +62,52 @@ export function isAsianTag(tag: string): boolean {
   return /^(zh|ja|ko)\b/i.test(tag.trim());
 }
 
+// A tag's slot: a paragraph or a run carries a western and an asian language, and a tag
+// in the wrong one (an older document's asian `lang`) counts for its own script.
+export const westLang = (tag: unknown): string | null =>
+  typeof tag === 'string' && tag && !isAsianTag(tag) ? tag : null;
+export const asianLang = (tag: unknown): string | null =>
+  typeof tag === 'string' && tag && isAsianTag(tag) ? tag : null;
+
+// The document's western and asian language: its main one and the other slot's tag.
+export function documentLangs(main: DocumentLanguage, other: string | null): { west: string | null; asian: string | null } {
+  const tags = [tagForLanguage(main), other];
+  return { west: tags.map(westLang).find(Boolean) ?? null, asian: tags.map(asianLang).find(Boolean) ?? null };
+}
+
+// The dictionary for text outside East Asian script: an East Asian document checks it
+// in its western language, where it has one.
+export function westernCode(main: DocumentLanguage, other: string | null): DocumentLanguage {
+  const tag = tagForLanguage(main);
+  if (!tag || !isAsianTag(tag)) return main;
+  const west = westLang(other);
+  return (west && codeForTag(west)) || main;
+}
+
+// A file's main language from its two defaults. Both word processors write an asian
+// default into every file whatever it is written in, so that one leads only where the
+// text is mostly East Asian, or where there is no western one.
+export function mainOfPair(west: string | null, asian: string | null, asianText: boolean): { main: string | null; other: string | null } {
+  return asian && (asianText || !west) ? { main: asian, other: west } : { main: west, other: asian };
+}
+
+// "For all text": the pick becomes the main language, and a main language of the other
+// script moves to the other slot, so the text in that script keeps its language. No
+// language clears both slots, as LibreOffice's "None" does.
+export function pickDocumentLanguage(main: DocumentLanguage, other: string | null, code: DocumentLanguage): { main: DocumentLanguage; other: string | null } {
+  if (code === NO_LANGUAGE) return { main: code, other: null };
+  const was = tagForLanguage(main);
+  const next = tagForLanguage(code);
+  return { main: code, other: was && next && isAsianTag(was) !== isAsianTag(next) ? was : other };
+}
+
+// The Han font an East Asian document defaults to, by region; null for any other language.
+const CJK_DOC_FONT: Record<string, string> = { TW: 'PMingLiU', HK: 'PMingLiU', MO: 'PMingLiU', JP: 'Yu Mincho' };
+export function cjkDocFont(tag: string): string | null {
+  if (!isAsianTag(tag)) return null;
+  return CJK_DOC_FONT[odfFromTag(tag)?.country ?? ''] ?? 'SimSun';
+}
+
 function isValid(code: string): boolean {
   return code === NO_LANGUAGE || !!findLanguage(code);
 }
@@ -80,10 +128,24 @@ export function saveDocumentLanguage(code: DocumentLanguage): void {
   localStorage.setItem(KEY, code);
 }
 
+export function loadDocumentLanguageOther(): string | null {
+  const tag = localStorage.getItem(OTHER_KEY);
+  return tag && odfFromTag(tag) ? tag : null;
+}
+
+export function saveDocumentLanguageOther(tag: string | null): void {
+  if (tag) localStorage.setItem(OTHER_KEY, tag);
+  else localStorage.removeItem(OTHER_KEY);
+}
+
 // → ODF fo:language/fo:country for export; null when checking is off.
 export function odfFromLanguage(code: DocumentLanguage): { language: string; country: string } | null {
   return findLanguage(code)?.odf ?? null;
 }
+
+// The document's language as the exporters take it: the main one split for ODF, plus
+// the other slot's tag.
+export type ExportLanguage = { language: string; country: string; other?: string | null };
 
 // A full language tag ('en-US', 'fr-FR') ↔ ODF's split fo:language/fo:country. The tag is
 // what a paragraph and a run carry, so a document in a language we have no dictionary for

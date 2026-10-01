@@ -7,6 +7,8 @@
      by App.svelte); extra bottom padding clears the fixed status bar. */
   padding: calc(var(--toolbar-overlay-h, 0px) + 1.25rem) 1rem 3rem;
   overflow: auto;
+  /* Pinch over the document is Editor.svelte's zoom, not the browser's. */
+  touch-action: pan-x pan-y;
   /* A flex item's automatic minimum is its content: without this a canvas wider than
      the window — a page grid, or a page beside the balloon strip — widens the whole app
      instead of scrolling here, and the toolbar above ends short of it. */
@@ -91,7 +93,11 @@
   min-height: var(--page-height);
   padding: var(--page-margin-top) var(--page-margin-right) var(--page-margin-bottom) var(--page-margin-left);
   outline: none;
-  font-family: var(--font-serif);
+  /* The font pair's variables (fontPairDeclarations, styleSheet.ts); --font-asian stays
+     unset unless the document's language has a Han default (Editor.svelte). */
+  --font-west: 'Liberation Serif', 'Times New Roman';
+  --font-tail: var(--font-serif);
+  font-family: var(--font-space,) var(--font-west), var(--font-asian, var(--font-tail)), var(--font-tail);
   /* 12pt matches odf-kit's Standard style and the toolbar's declared default. */
   font-size: 12pt;
   /* "Single" spacing is the font's natural line height (Liberation Serif ≈ 1.15× em),
@@ -100,6 +106,9 @@
   --natural-line: 1.15;
   --line-factor: 1;
   line-height: 1.15;
+  /* Both word processors space ideographs from Latin letters and digits by default
+     (Word ¼em, LibreOffice ⅕em, measured); the browser's own step is ⅛em. */
+  text-autospace: normal;
   color: var(--color-page-text);
 
   /* The page borders ride the sheet boxes (PageSheetLayer). */
@@ -405,6 +414,12 @@
 .paper .tiptap .image-node.image-line:not([data-v-align='offset']) {
   vertical-align: bottom !important;
 }
+/* ProseMirror's caret shim after a paragraph-ending image: an image wider than the line
+   leaves it no room, and it wrapped onto an empty line of its own that neither word
+   processor sets. Out of flow it takes none. */
+.paper .tiptap .image-node.image-line + img.ProseMirror-separator {
+  position: absolute;
+}
 /* While selected, lift the node (and its handles) above the header/footer layer
    (z-index 22) so a rotate/resize handle poking into a margin stays grabbable. */
 .paper .tiptap .image-node.image-selected {
@@ -429,12 +444,17 @@
   top: 50%;
   transform: translate(-50%, -50%);
 }
+.paper .tiptap .image-crop {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
 .paper .tiptap .image-rotor img {
   width: 100%;
   height: 100%;
   display: block;
 }
-.paper .tiptap .image-node.image-selected .image-rotor img {
+.paper .tiptap .image-node.image-selected .image-crop {
   outline: 2px solid var(--color-primary);
   outline-offset: 1px;
 }
@@ -674,9 +694,33 @@
 
 /* The line box: the paragraph's spacing factor times its font's natural line height.
    Either half may come from the style rule or, nearer, from the block's own attrs
-   (lineHeight.ts / blockFontSize.ts) — multiplying them here is what keeps both. */
-.paper .tiptap :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, li, .toc-entry) {
-  line-height: calc(var(--line-factor) * var(--natural-line));
+   (lineHeight.ts / blockFontSize.ts) — multiplying them here is what keeps both.
+   A fixed spacing (--line-fixed) replaces the product outright. */
+/* A run in a face of its own sets the same product with that face's natural line, so a
+   taller one raises its line as in both word processors; a fixed spacing stays fixed. */
+.paper .tiptap :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, li, .toc-entry),
+.paper .tiptap :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, li, .toc-entry) :is([style*='--natural-line'], [data-char-style]) {
+  line-height: var(--line-fixed, calc(var(--line-factor) * var(--natural-line)));
+}
+
+/* The page's line grid rounds each line up to whole grid lines, one exactly a pitch tall
+   too (Word: 12pt SimSun, 15.6pt, takes two of 15.6pt). A fixed spacing, a block off the
+   grid, a zone and a text box are not on it. Per element, so a larger run rounds by its size. */
+.paper[data-line-grid] .tiptap :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, li, .toc-entry):not([data-snap-to-grid='false']):not(:is(.hf-zone, .textbox-node) *),
+.paper[data-line-grid] .tiptap :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, .toc-entry):not([data-snap-to-grid='false']):not(:is(.hf-zone, .textbox-node) *) :not(.textbox-node, .textbox-node *) {
+  line-height: var(--line-fixed, round(up, calc(var(--line-factor) * var(--natural-line) * 1em + 0.01pt), var(--grid-pitch)));
+}
+
+/* Bold in a face Word has none for is the regular face stroked (FONT_PROFILES, styleSheet.ts). */
+.paper .tiptap strong {
+  font-weight: var(--bold-weight, bolder);
+  -webkit-text-stroke-width: var(--bold-stroke, 0);
+}
+
+/* A document balancing single- and double-byte widths sets every space at half its size
+   (storage/balanceSpaces.ts): the half-width face goes in front of each font stack. */
+.paper[data-balance-spaces] {
+  --font-space: 'EdenText Space',;
 }
 
 /* A spacing above single puts all of its extra leading *below* each line (measured in
@@ -705,6 +749,10 @@
 .paper .tiptap li {
   list-style: none;
 }
+/* The level's hanging indent; a list's own `hanging` attr sets it inline (listMarker.ts). */
+.paper .tiptap :is(ol, ul) {
+  --list-hang: 0.635cm;
+}
 
 /* The containing block for the right-aligned marker below, which stays absolute. */
 .paper .tiptap li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10) {
@@ -716,8 +764,8 @@
    the first line right instead of printing under it, as both word processors do. */
 .paper .tiptap li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before {
   float: left;
-  min-width: 0.635cm;
-  margin-left: -0.635cm;
+  min-width: max(0cm, var(--list-hang));
+  margin-left: calc(-1 * var(--list-hang));
   white-space: pre;
   line-height: inherit;
   /* The marker follows the item's first text portion (listMarker.ts sets the custom
@@ -737,7 +785,11 @@
   top: 0;
   min-width: 0;
   margin-left: 0;
-  right: calc(100% + 0.635cm);
+  right: calc(100% + var(--list-hang));
+}
+/* A label followed by a space or nothing has no tab to run to: the text follows it. */
+.paper .tiptap :is(ol, ul)[data-marker-suffix] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before {
+  min-width: 0;
 }
 
 /* Ordered numbering, keyed by data-eff-list-style — the effective numbering
@@ -762,6 +814,8 @@
 .paper .tiptap :is(ol, ul)[data-eff-list-style="cjk-legal"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before { content: counter(list-item, simp-chinese-formal) "、"; }
 .paper .tiptap :is(ol, ul)[data-eff-list-style="cjk-stem"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before { content: counter(list-item, edt-stem) "、"; }
 .paper .tiptap :is(ol, ul)[data-eff-list-style="circled-decimal"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before { content: counter(list-item, edt-circled) " "; }
+.paper .tiptap :is(ol, ul)[data-eff-list-style="katakana"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before { content: counter(list-item, edt-aiueo) ". "; }
+.paper .tiptap :is(ol, ul)[data-eff-list-style="katakana-iroha"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before { content: counter(list-item, edt-iroha) ". "; }
 
 /* Both styles run out and then number on in decimal, which is what LibreOffice does and
    what formatOrdinal writes into a PDF — CSS's own cjk-heavenly-stem would instead carry
@@ -775,6 +829,20 @@
 @counter-style edt-circled {
   system: fixed 1;
   symbols: "①" "②" "③" "④" "⑤" "⑥" "⑦" "⑧" "⑨" "⑩" "⑪" "⑫" "⑬" "⑭" "⑮" "⑯" "⑰" "⑱" "⑲" "⑳" "㉑" "㉒" "㉓" "㉔" "㉕" "㉖" "㉗" "㉘" "㉙" "㉚" "㉛" "㉜" "㉝" "㉞" "㉟" "㊱" "㊲" "㊳" "㊴" "㊵" "㊶" "㊷" "㊸" "㊹" "㊺" "㊻" "㊼" "㊽" "㊾" "㊿";
+  suffix: "";
+}
+
+/* Kana start over from their first sign, as LibreOffice and formatOrdinal do; CSS's own
+   katakana styles would double up (アア) and count ヰ and ヱ into the aiueo row. */
+@counter-style edt-aiueo {
+  system: cyclic;
+  symbols: "ア" "イ" "ウ" "エ" "オ" "カ" "キ" "ク" "ケ" "コ" "サ" "シ" "ス" "セ" "ソ" "タ" "チ" "ツ" "テ" "ト" "ナ" "ニ" "ヌ" "ネ" "ノ" "ハ" "ヒ" "フ" "ヘ" "ホ" "マ" "ミ" "ム" "メ" "モ" "ヤ" "ユ" "ヨ" "ラ" "リ" "ル" "レ" "ロ" "ワ" "ヲ" "ン";
+  suffix: "";
+}
+
+@counter-style edt-iroha {
+  system: cyclic;
+  symbols: "イ" "ロ" "ハ" "ニ" "ホ" "ヘ" "ト" "チ" "リ" "ヌ" "ル" "ヲ" "ワ" "カ" "ヨ" "タ" "レ" "ソ" "ツ" "ネ" "ナ" "ラ" "ム" "ウ" "ヰ" "ノ" "オ" "ク" "ヤ" "マ" "ケ" "フ" "コ" "エ" "テ" "ア" "サ" "キ" "ユ" "メ" "ミ" "シ" "ヱ" "ヒ" "モ" "セ" "ス" "ン";
   suffix: "";
 }
 
@@ -865,10 +933,11 @@
   padding: var(--cell-pad-t, 0) var(--cell-pad-r, 0.19cm) var(--cell-pad-b, 0) var(--cell-pad-l, 0.19cm);
   /* A painted border is a whole pixel wide whatever the file declares, so the excess
      comes off the padding — else a long table grows a line every few rows
-     (tableCellBorders.ts). Below first, then what is left of it above. */
-  padding-bottom: max(0px, calc(var(--cell-pad-b, 0px) - var(--border-over, 0px)));
-  padding-top: max(0px, calc(
-    var(--cell-pad-t, 0px) - max(0px, var(--border-over, 0px) - var(--cell-pad-b, 0px))));
+     (tableCellBorders.ts). Below first, then what is left of it above, then ::after. */
+  --border-over-default: calc(1px - 0.5pt);
+  padding-bottom: max(0px, calc(var(--cell-pad-b, 0px) - var(--border-over, var(--border-over-default))));
+  padding-top: max(0px, calc(var(--cell-pad-t, 0px)
+    - max(0px, var(--border-over, var(--border-over-default)) - var(--cell-pad-b, 0px))));
   vertical-align: top;
   /* A repeating header row is a <th>, and no word processor centres or bolds its text
      for that reason — drop the two UA defaults so the cell follows its own style. */
@@ -877,6 +946,23 @@
   /* Positioning context for the column-resize handle widget (a child div the
      resize plugin places at the cell's right edge). */
   position: relative;
+}
+
+/* What of the border's excess no padding could take: a negative margin on an empty last
+   block, which collapses with the cell's last paragraph's own space below. */
+.paper .tiptap :is(td, th)::after {
+  content: '';
+  display: block;
+  margin-top: min(0px, calc(var(--cell-pad-t, 0px) + var(--cell-pad-b, 0px)
+    - var(--border-over, var(--border-over-default))));
+}
+
+/* Word measures a cell's margin from the grid line, and the border takes nothing from the
+   text (its PDF centres a line in exactly width − margins); the collapsed border puts half
+   a painted pixel inside each side. ponytail: assumes 1px lines, a thick one still costs. */
+.paper[data-spacing-model='max'] .tiptap :is(td, th) {
+  padding-left: calc(var(--cell-pad-l, 0.19cm) - 0.5px);
+  padding-right: calc(var(--cell-pad-r, 0.19cm) - 0.5px);
 }
 
 /* No space below a cell paragraph that names no style: LibreOffice's Table Contents and
@@ -1077,15 +1163,17 @@
   user-select: none;
 }
 
-/* Spell-check: red wavy underline under misspelled words (drawn by spellCheck.ts).
+/* Spell-check: red wavy underline under misspelled words (painted by spellCheck.ts).
    skip-ink:none keeps the wave continuous under descenders. */
-.tiptap .pm-spell-error {
+.tiptap .pm-spell-error,
+::highlight(spell-error) {
   text-decoration: red wavy underline;
   text-decoration-skip-ink: none;
 }
 
 /* Grammar check: a blue wave, so a grammar finding reads apart from a spelling one. */
-.tiptap .pm-grammar-error {
+.tiptap .pm-grammar-error,
+::highlight(grammar-error) {
   text-decoration: #2b6cb0 wavy underline;
   text-decoration-skip-ink: none;
 }
@@ -1220,7 +1308,9 @@
 
   /* Squiggles are an editing aid, never printed. */
   .tiptap .pm-spell-error,
-  .tiptap .pm-grammar-error {
+  .tiptap .pm-grammar-error,
+  ::highlight(spell-error),
+  ::highlight(grammar-error) {
     text-decoration: none;
   }
 

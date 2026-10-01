@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy, untrack } from 'svelte';
+  import { onMount, onDestroy, untrack, flushSync } from 'svelte';
   import { Editor } from '@tiptap/core';
   import { Slice, Fragment } from 'prosemirror-model';
   import type { Node as PmNode, MarkType } from 'prosemirror-model';
@@ -23,7 +23,7 @@
   import { findTextBox, type ShapeKind } from '../editor/extensions/textBox';
   import { dropRemoteImages, unwrapPastedBoxes, flattenToInline, plainPastedSpaces } from '../editor/paste';
   import { inNote } from '../editor/extensions/notes';
-  import { NodeSelection, TextSelection } from '@tiptap/pm/state';
+  import { NodeSelection, Selection, TextSelection } from '@tiptap/pm/state';
   import { EditorView } from '@tiptap/pm/view';
   import ContextMenu from './ContextMenu.svelte';
   import HeaderFooterLayer from './HeaderFooterLayer.svelte';
@@ -36,16 +36,16 @@ import ChangeBarLayer from './ChangeBarLayer.svelte';
   import { visibleComments, visibleRevisions } from './reviewItems';
   import { changesInMargin, commentsInMargin, markupView } from '../storage/markup.svelte';
 import { DEFAULT_LINE_NUMBERING, type LineNumbering } from '../storage/lineNumbering';
+import { DEFAULT_LINE_GRID, type LineGrid } from '../storage/lineGrid';
 import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
   import Ruler from './Ruler.svelte';
   import { saveDocument, loadDocument, markDocumentLoaded } from '../storage/autosave';
   import { IDB_SRC } from '../storage/imageStore';
-  import { fitInlineImage } from '../editor/extensions/image';
   import { applyMarginVars, cmToPx, PX_PER_CM, DEFAULT_MARGINS, type PageMargins } from '../storage/pageMargins';
   import { DEFAULT_TAB_INTERVAL_CM } from '../storage/tabInterval';
   import { type Orientation } from '../storage/pageOrientation';
   import { type SpacingModel } from '../storage/spacingModel';
-  import { NO_LANGUAGE } from '../storage/documentLanguage';
+  import { NO_LANGUAGE, cjkDocFont, tagForLanguage } from '../storage/documentLanguage';
   import { DEFAULT_PAGE_NUMBERING, isLeftPage, printedPageNumber, type PageNumbering } from '../storage/pageNumbering';
   import { applyNoteVars } from '../storage/noteSettings';
   import { noteSettings } from '../storage/notes.svelte';
@@ -58,7 +58,7 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
   import { goToTarget } from '../editor/extensions/bookmark';
   import { recordTransaction, resetHistoryLog } from '../utils/historyLog.svelte';
   import { fitPagesZoom, wheelZoomFactor } from '../utils/zoom';
-  import { styleCss, singleLineHeight } from '../styles/styleSheet';
+  import { styleCss, singleLineHeight, fauxBold } from '../styles/styleSheet';
   import { styleSheet } from '../styles/sheet.svelte';
   import { t } from '../i18n/i18n.svelte';
   import { withShortcut } from '../i18n/shortcut';
@@ -66,8 +66,8 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
 
   let {
     editor = $bindable(), tick = $bindable(0), currentPage = $bindable(1), numPages = $bindable(1),
-    zoom = 100, onZoom, showFormattingMarks = false, showFieldShading = true, showRuler = true, splitView = false, pageColumns = 1, pageMargins = DEFAULT_MARGINS, orientation = 'portrait',
-    pageFormat = 'A4', tabIntervalCm = DEFAULT_TAB_INTERVAL_CM, spacingModel = 'add', spacingAtPageStart = true, documentEpoch = 0, pageRtl = false, hyphenate = false, documentLanguage = 'en', pageNumbering = DEFAULT_PAGE_NUMBERING, pageDecor = EMPTY_PAGE_DECOR, lineNumbering = DEFAULT_LINE_NUMBERING, foldMarks = false, commentAuthor = '',
+    zoom = 100, onZoom, onDocumentLost, showFormattingMarks = false, showFieldShading = true, showRuler = true, splitView = false, pageColumns = 1, pageMargins = DEFAULT_MARGINS, orientation = 'portrait',
+    pageFormat = 'A4', tabIntervalCm = DEFAULT_TAB_INTERVAL_CM, spacingModel = 'add', spacingAtPageStart = true, documentEpoch = 0, pageRtl = false, hyphenate = false, documentLanguage = 'en', pageNumbering = DEFAULT_PAGE_NUMBERING, pageDecor = EMPTY_PAGE_DECOR, lineNumbering = DEFAULT_LINE_NUMBERING, lineGrid = DEFAULT_LINE_GRID, balanceSpaces = false, foldMarks = false, commentAuthor = '',
     headerDoc = $bindable(null), footerDoc = $bindable(null), hfDistances = DEFAULT_HF_DISTANCES,
     headerFirstDoc = $bindable(null), footerFirstDoc = $bindable(null), differentFirstPage = false,
     headerEvenDoc = $bindable(null), footerEvenDoc = $bindable(null), differentOddEven = false,
@@ -76,6 +76,8 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
   }: {
     editor: Editor | null; tick: number; currentPage: number; numPages: number; zoom: number;
     onZoom?: (zoom: number) => void;
+    /** The stored document was given up at startup; the editor starts empty. */
+    onDocumentLost?: () => void;
     showFormattingMarks?: boolean; showFieldShading?: boolean; showRuler?: boolean; pageMargins?: PageMargins; orientation?: Orientation; pageFormat?: PageFormat; tabIntervalCm?: number; spacingModel?: SpacingModel; spacingAtPageStart?: boolean;
     /** Two panes onto this document, scrolled on their own (Word's View ▸ Split). */
     splitView?: boolean;
@@ -95,6 +97,10 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
     pageDecor?: PageDecor;
     /** Numbers in the left margin, one per rendered line. */
     lineNumbering?: LineNumbering;
+    /** Lines rounded up to whole grid lines (editor.css, --grid-pitch). */
+    lineGrid?: LineGrid;
+    /** Every space at half the font size (storage/balanceSpaces.ts). */
+    balanceSpaces?: boolean;
     /** Fold + punch marks in the left margin (DIN 5008 letter sheets). */
     foldMarks?: boolean;
     headerDoc?: HfDoc; footerDoc?: HfDoc; hfDistances?: HfDistances;
@@ -179,42 +185,59 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
   let hfZoneHeights = $state<number[][]>([]);
   const zoneHeightPx = (section: number, key: HfZoneKey): number =>
     hfZoneHeights[section]?.[HF_ZONE_KEYS.indexOf(key)] ?? 0;
+  // How far a header's frames set against the body push its text down (HeaderFooterLayer).
+  let hfZoneIntrusions = $state<number[][]>([]);
+  const pushed = (top: number, section: number, key: HfZoneKey): number =>
+    top + (hfZoneIntrusions[section]?.[HF_ZONE_KEYS.indexOf(key)] ?? 0);
   function hfReachPx(doc: HfDoc, distPx: number, footer = false, measuredPx = 0): number {
     if (!doc || hfIsEmpty(doc)) return 0;
+    // The measured band wins where there is one: the estimate below cannot see a line
+    // that wraps, and it only ever grows a line past the 12pt default. It carries the
+    // paragraph's space above already (HeaderFooterLayer measures with it).
+    if (measuredPx > 0) return distPx + measuredPx;
     type Run = { type?: string; attrs?: { height?: number; wrap?: string }; marks?: { type?: string; attrs?: { fontSize?: string; fontFamily?: string } }[] };
-    const para = doc.content?.[0] as { content?: Run[]; attrs?: { spaceBefore?: number; spaceAfter?: number; fontSize?: string; fontFamily?: string } } | undefined;
-    const inline = para?.content ?? [];
+    type Block = { type?: string; content?: Run[]; attrs?: { spaceBefore?: number; fontSize?: string; fontFamily?: string } };
     // A line is its font's own natural height: the zone's biggest run sizes its lines and
     // LibreOffice grows the band to hold them where fo:min-height is smaller (probed).
     // The body default only stands in for a run that declares no size of its own.
     const line = (size?: string, family?: string) =>
       size ? (parseFloat(size) * 96) / 72 * singleLineHeight(family) : HF_LINE_PX;
-    // The paragraph mark is the strut every run that declares no size of its own takes.
-    const base = line(para?.attrs?.fontSize, para?.attrs?.fontFamily);
-    let linePx = base;
-    for (const n of inline) {
-      if (n.type === 'image') continue;
-      const ts = n.marks?.find((m) => m.type === 'textStyle')?.attrs;
-      linePx = Math.max(linePx, ts?.fontSize ? line(ts.fontSize, ts.fontFamily) : base);
-    }
-    // Per line, since an as-character image (a letterhead logo) makes its own line
-    // as tall as it is; the others are one text line each. A positioned frame is out
-    // of flow — a page-sized background would otherwise reserve the whole page.
-    let total = 0;
-    let image = 0;
-    for (const n of inline) {
-      if (n.type === 'hardBreak') { total += Math.max(linePx, image); image = 0; }
-      else if (n.type === 'image' && typeof n.attrs?.height === 'number' && (n.attrs.wrap ?? 'inline') === 'inline') image = Math.max(image, n.attrs.height);
-    }
+    const blockPx = (para: Block): number => {
+      // Anything but a text block (a table, a list) is estimated as one line.
+      if (para.type !== 'paragraph' && para.type !== 'heading') return HF_LINE_PX;
+      const inline = para.content ?? [];
+      // The paragraph mark is the strut every run that declares no size of its own takes.
+      const base = line(para.attrs?.fontSize, para.attrs?.fontFamily);
+      let linePx = base;
+      for (const n of inline) {
+        if (n.type === 'image') continue;
+        const ts = n.marks?.find((m) => m.type === 'textStyle')?.attrs;
+        linePx = Math.max(linePx, ts?.fontSize ? line(ts.fontSize, ts.fontFamily) : base);
+      }
+      // Per line, since an as-character image (a letterhead logo) makes its own line
+      // as tall as it is; the others are one text line each. A positioned frame is out
+      // of flow — a page-sized background would otherwise reserve the whole page.
+      let total = 0;
+      let image = 0;
+      for (const n of inline) {
+        if (n.type === 'hardBreak') { total += Math.max(linePx, image); image = 0; }
+        else if (n.type === 'image' && typeof n.attrs?.height === 'number' && (n.attrs.wrap ?? 'inline') === 'inline') image = Math.max(image, n.attrs.height);
+      }
+      return total + Math.max(linePx, image);
+    };
+    const blocks = (doc.content ?? []) as Block[];
     // A footer is laid out from the page edge up, so its space above rides the band too;
     // a header's space below is part of the band the body starts under.
-    const spacing = footer ? ((para?.attrs?.spaceBefore ?? 0) * 96) / 72 : 0;
-    // The measured band wins where there is one: the estimate below cannot see a line
-    // that wraps, and it only ever grows a line past the 12pt default. It carries the
-    // paragraph's space above already (HeaderFooterLayer measures with it).
-    if (measuredPx > 0) return distPx + measuredPx;
-    return distPx + spacing + total + Math.max(linePx, image);
+    const spacing = footer ? ((blocks[0]?.attrs?.spaceBefore ?? 0) * 96) / 72 : 0;
+    return distPx + spacing + blocks.reduce((sum, b) => sum + blockPx(b), 0);
   }
+
+  // The Han font of an East Asian document, where text naming no asian font falls back to.
+  let asianDefaultFont = $derived.by(() => {
+    const font = cjkDocFont(tagForLanguage(documentLanguage) ?? '');
+    return font ? `"${font}"` : null;
+  });
+  let asianFauxBold = $derived(fauxBold(cjkDocFont(tagForLanguage(documentLanguage) ?? '') ?? ''));
   let footerDistPx = $derived(cmToPx((hfDistances ?? DEFAULT_HF_DISTANCES).footer));
   let headerDistPx = $derived(cmToPx((hfDistances ?? DEFAULT_HF_DISTANCES).header));
   let mBottomPx = $derived(cmToPx(pageMargins.bottom));
@@ -222,12 +245,13 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
   // Effective top/bottom margins (px) pageBreaks reads to keep content clear of the
   // header/footer: "first" = page 1's own zone, "rest" = every page ≥ 2 with the even
   // variant folded in (max), since one --pb-content-*-rest covers all of them.
-  let evenTopReach = $derived(differentOddEven ? hfReachPx(headerEvenDoc ?? null, headerDistPx, false, zoneHeightPx(0, 'headerEven')) : 0);
+  let evenTopReach = $derived(differentOddEven
+    ? pushed(Math.max(mTopPx, hfReachPx(headerEvenDoc ?? null, headerDistPx, false, zoneHeightPx(0, 'headerEven'))), 0, 'headerEven') : 0);
   let evenBottomReach = $derived(differentOddEven ? hfReachPx(footerEvenDoc ?? null, footerDistPx, true, zoneHeightPx(0, 'footerEven')) : 0);
-  let effTopRest = $derived(Math.max(mTopPx, hfReachPx(headerDoc ?? null, headerDistPx, false, zoneHeightPx(0, 'header')), evenTopReach));
-  let effTopFirst = $derived(Math.max(mTopPx, differentFirstPage
-    ? hfReachPx(headerFirstDoc ?? null, headerDistPx, false, zoneHeightPx(0, 'headerFirst'))
-    : hfReachPx(headerDoc ?? null, headerDistPx, false, zoneHeightPx(0, 'header'))));
+  let effTopRest = $derived(Math.max(pushed(Math.max(mTopPx, hfReachPx(headerDoc ?? null, headerDistPx, false, zoneHeightPx(0, 'header'))), 0, 'header'), evenTopReach));
+  let effTopFirst = $derived(differentFirstPage
+    ? pushed(Math.max(mTopPx, hfReachPx(headerFirstDoc ?? null, headerDistPx, false, zoneHeightPx(0, 'headerFirst'))), 0, 'headerFirst')
+    : pushed(Math.max(mTopPx, hfReachPx(headerDoc ?? null, headerDistPx, false, zoneHeightPx(0, 'header'))), 0, 'header'));
   let effBottomRest = $derived(Math.max(mBottomPx, hfReachPx(footerDoc ?? null, footerDistPx, true, zoneHeightPx(0, 'footer')), evenBottomReach));
   let effBottomFirst = $derived(Math.max(mBottomPx, differentFirstPage
     ? hfReachPx(footerFirstDoc ?? null, footerDistPx, true, zoneHeightPx(0, 'footerFirst'))
@@ -249,9 +273,11 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
       const fDist = (d: HfDistances | null) => (d ? cmToPx(d.footer) : footerDistPx);
       const reach = (key: HfZoneKey, dist: number, footer = false) =>
         hfReachPx(s[key] ?? null, dist, footer, zoneHeightPx(i + 1, key));
+      const firstKey = s.differentFirstPage ? 'headerFirst' : 'header';
       return [
-        Math.max(topOf(first), reach(s.differentFirstPage ? 'headerFirst' : 'header', hDist(firstD))),
-        Math.max(topOf(rest), reach('header', hDist(restD)), s.differentOddEven ? reach('headerEven', hDist(restD)) : 0),
+        pushed(Math.max(topOf(first), reach(firstKey, hDist(firstD))), i + 1, firstKey),
+        Math.max(pushed(Math.max(topOf(rest), reach('header', hDist(restD))), i + 1, 'header'),
+          s.differentOddEven ? pushed(Math.max(topOf(rest), reach('headerEven', hDist(restD))), i + 1, 'headerEven') : 0),
         Math.max(bottomOf(first), reach(s.differentFirstPage ? 'footerFirst' : 'footer', fDist(firstD), true)),
         Math.max(bottomOf(rest), reach('footer', fDist(restD), true), s.differentOddEven ? reach('footerEven', fDist(restD), true) : 0),
       ];
@@ -381,6 +407,10 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
     void tabIntervalCm;
     // …and how the space between two blocks is measured.
     void spacingModel;
+    // …and the line grid, which sets every line's height.
+    void (lineGrid.on && lineGrid.pitchPt);
+    // …and the width of a space.
+    void balanceSpaces;
     // …and the header/footer-driven effective margins, so growing a zone re-paginates.
     void (effTopRest + effTopFirst + effBottomRest + effBottomFirst);
     void sectionReach;
@@ -545,14 +575,13 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
   let grammarTarget: { from: number; to: number; message: string; text: string; fixes: GrammarFix[] } | null = null;
 
   function openContextMenu(event: MouseEvent, pane: number) {
-    const ed = editor;
+    const ed = uiEditor;
     activePane = pane;
     const container = paneScroller();
     // Shift+right-click yields to the browser menu, whose Paste needs no clipboard
-    // permission (Firefox does this for page handlers by itself). Header/footer keeps
-    // the browser menu too — the schema has none of the entries below.
-    if (!ed || event.shiftKey || hfActive || !container) return;
-    const view = paneView();
+    // permission (Firefox does this for page handlers by itself).
+    if (!ed || event.shiftKey || !container) return;
+    const view = uiView();
     const target = event.target as HTMLElement | null;
     if (!view || !target || !view.dom.contains(target)) return;
     if (target.closest('.image-node, .textbox-node')) return; // own floating toolbars
@@ -668,6 +697,16 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
     linkTip = null;
   }
 
+  // The floating chrome and the context menu describe the editor being worked in: an
+  // open header/footer zone's, else the body's.
+  let uiEditor = $derived(hfActive && hfEditor ? hfEditor : editor);
+  let uiTick = $derived(tick + hfTick);
+  const uiView = (): EditorView | null => (hfActive && hfEditor ? hfEditor.view : paneView());
+  $effect(() => {
+    void hfTick;
+    scheduleTableUi();
+  });
+
   // --- Floating table-editing toolbar ---
   // Shown when the selection is inside a table; positioned just above that table.
   let tableUi = $state<{ visible: boolean; top: number; left: number; bottom: number }>({ visible: false, top: 0, left: 0, bottom: 0 });
@@ -677,8 +716,8 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
   // What the sort and formula popovers open on: the grid around the cursor's cell.
   const NO_TABLE = { columns: 1, column: 0, headerRow: false, cell: null as string | null, formula: '=SUM(ABOVE)', format: null as CellFormat | null };
   let tableGrid = $derived.by(() => {
-    const state = editor?.state;
-    if (tick < 0 || !state || !isInTable(state)) return NO_TABLE;
+    const state = uiEditor?.state;
+    if (uiTick < 0 || !state || !isInTable(state)) return NO_TABLE;
     const rect = selectedRect(state);
     return {
       columns: rect.map.width,
@@ -729,9 +768,9 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
   }
 
   function recomputeTableUi() {
-    const ed = editor;
+    const ed = uiEditor;
     const container = paneScroller();
-    const view = paneView();
+    const view = uiView();
     if (!ed || !container || !view) {
       if (tableUi.visible) tableUi = { ...tableUi, visible: false };
       return;
@@ -782,9 +821,9 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
   let imageUi = $state<{ visible: boolean; top: number; left: number; wrap: WrapMode; inFront: boolean }>({ visible: false, top: 0, left: 0, wrap: 'inline', inFront: false });
 
   function recomputeImageUi() {
-    const ed = editor;
+    const ed = uiEditor;
     const container = paneScroller();
-    const view = paneView();
+    const view = uiView();
     if (!ed || !container || !view) {
       if (imageUi.visible) imageUi = { ...imageUi, visible: false };
       return;
@@ -816,9 +855,9 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
   }>({ visible: false, top: 0, left: 0, wrap: 'inline', inFront: false, wrapAlign: null, shapeKind: 'textbox', fillColor: '#FFFFFF', strokeColor: '#000000', strokeWidthPt: 1, textVertical: false });
 
   function recomputeTextBoxUi() {
-    const ed = editor;
+    const ed = uiEditor;
     const container = paneScroller();
-    const view = paneView();
+    const view = uiView();
     const found = ed && container && view && !imageUi.visible ? findTextBox(ed.state) : null;
     const dom = found ? view!.nodeDOM(found.pos) : null;
     if (!found || !(dom instanceof HTMLElement)) {
@@ -934,6 +973,25 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
     e.preventDefault();
     pendingAnchor = { x: e.clientX, y: e.clientY, pane };
     onZoom(zoom * wheelZoomFactor(e.deltaY, e.deltaMode));
+  }
+
+  // A two-finger pinch over the document zooms the document, not the whole app:
+  // `touch-action` on `.editor` keeps the browser's own pinch-zoom off this area.
+  // Scaled from the gesture's start, so rounding in clampZoom never accumulates.
+  let pinchStart: { dist: number; zoom: number } | null = null;
+  function onPinch(e: TouchEvent, pane: number) {
+    if (e.touches.length !== 2 || !onZoom) {
+      pinchStart = null;
+      return;
+    }
+    const [a, b] = [e.touches[0], e.touches[1]];
+    const dist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+    if (!pinchStart || e.type === 'touchstart') {
+      pinchStart = { dist, zoom };
+      return;
+    }
+    pendingAnchor = { x: (a.clientX + b.clientX) / 2, y: (a.clientY + b.clientY) / 2, pane };
+    onZoom(pinchStart.zoom * dist / pinchStart.dist);
   }
 
   // The point held fixed across a zoom change: the pointer for a wheel zoom, else
@@ -1071,24 +1129,27 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
     // The document height changed → resize the scaled scroll footprint.
     recomputeScaledSize();
     updateCurrentPage();
+    // A new layout can move the caret onto another page with no selection change.
+    if (multiPage && gridFocused()) scheduleCaretPage();
     // Pagination spacers can shift a table's position — re-place the toolbar/bands.
     scheduleTableUi();
   }
 
-  function applyFontToFragment(frag: Fragment, textStyleType: MarkType, font: string): Fragment {
+  function applyFontToFragment(frag: Fragment, textStyleType: MarkType, fonts: Record<string, string>): Fragment {
     const nodes: PmNode[] = [];
     frag.forEach((node: PmNode) => {
       if (node.isText) {
         const existingTS = node.marks.find(m => m.type === textStyleType);
-        if (existingTS?.attrs.fontFamily) {
+        const missing = Object.entries(fonts).filter(([k]) => !existingTS?.attrs[k]);
+        if (!missing.length) {
           nodes.push(node);
         } else {
-          const newAttrs = { ...(existingTS?.attrs ?? {}), fontFamily: font };
+          const newAttrs = { ...(existingTS?.attrs ?? {}), ...Object.fromEntries(missing) };
           const otherMarks = node.marks.filter(m => m.type !== textStyleType);
           nodes.push(node.mark([...otherMarks, textStyleType.create(newAttrs)]));
         }
       } else {
-        nodes.push(node.copy(applyFontToFragment(node.content, textStyleType, font)));
+        nodes.push(node.copy(applyFontToFragment(node.content, textStyleType, fonts)));
       }
     });
     return Fragment.fromArray(nodes);
@@ -1215,7 +1276,7 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
     resetHistoryLog();
     // Awaited: the document's pictures live in IndexedDB, and the editor is built
     // from the whole document or the first pagination pass measures the wrong one.
-    const saved = await loadDocument();
+    const saved = await loadDocument(onDocumentLost);
 
     editor = new Editor({
       element: hosts[0],
@@ -1226,6 +1287,9 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
         // they don't double up.
         attributes: { spellcheck: 'false' },
         handleScrollToSelection: () => multiPage || (paneCount > 1 && activePane !== 0),
+        // Copied onto every pane's view with the rest of these props.
+        handleKeyDown: (view, event) => multiPage && !hfActive && (event.key === 'PageDown' || event.key === 'PageUp')
+          && !event.altKey && !event.ctrlKey && !event.metaKey && gridPageStep(view, event.key === 'PageDown' ? 1 : -1, event.shiftKey),
         // Ctrl/Cmd+click opens a hyperlink (a plain click just places the cursor).
         handleClick: (view, _pos, event) => {
           if (!(event.metaKey || event.ctrlKey)) return false;
@@ -1269,11 +1333,13 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
           const textStyleType = view.state.schema.marks.textStyle;
           if (!textStyleType) return localImages;
           const cursorMarks = view.state.storedMarks ?? view.state.selection.$head.marks();
-          // Only an explicit font at the caret is carried over: with none, the pasted
-          // text inherits the paragraph's style, as it does in both word processors.
-          const font = cursorMarks.find(m => m.type === textStyleType)?.attrs.fontFamily as string | undefined;
-          if (!font) return localImages;
-          return new Slice(applyFontToFragment(localImages.content, textStyleType, font), localImages.openStart, localImages.openEnd);
+          // Only an explicit font at the caret is carried over, each half of the pair on
+          // its own: with none, the pasted text inherits the paragraph's style, as it does
+          // in both word processors.
+          const attrs = cursorMarks.find(m => m.type === textStyleType)?.attrs ?? {};
+          const fonts = Object.fromEntries(['fontFamily', 'fontFamilyAsian'].filter((k) => attrs[k]).map((k) => [k, attrs[k] as string]));
+          if (!Object.keys(fonts).length) return localImages;
+          return new Slice(applyFontToFragment(localImages.content, textStyleType, fonts), localImages.openStart, localImages.openEnd);
         },
       },
       onTransaction: ({ editor: e, transaction }) => {
@@ -1358,10 +1424,12 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
   // Scroll position of the canvas top, with the floating toolbar's overlay left free:
   // a row scrolled to the scroller's own top would sit behind the island.
   function gridOrigin(el: HTMLElement): number {
-    // Inherited from the app shell, which is where the floating chrome measures itself.
-    const overlay = parseFloat(getComputedStyle(el).getPropertyValue('--toolbar-overlay-h')) || 0;
-    return (canvasEl?.offsetTop ?? 0) - overlay;
+    return (canvasEl?.offsetTop ?? 0) - toolbarOverlay(el);
   }
+
+  // Inherited from the app shell, which is where the floating chrome measures itself.
+  const toolbarOverlay = (el: HTMLElement) =>
+    parseFloat(getComputedStyle(el).getPropertyValue('--toolbar-overlay-h')) || 0;
 
   function readFirstRow() {
     const el = scrollers[0];
@@ -1384,6 +1452,29 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
     el.scrollTop = gridOrigin(el) + row * firstCycle * (appliedZoom / 100);
   }
 
+  // Where the caret is drawn: a position at a wrap is also the next line's start, a page
+  // away where that line was pushed on. Measured in the text, since a range between
+  // elements measures the page-break spacer beside it; an empty note, as its element.
+  function caretCoords(view: EditorView): { top: number; bottom: number; left: number } {
+    const sel = view.dom.ownerDocument.getSelection();
+    let node = sel?.focusNode ?? null;
+    let offset = sel?.focusOffset ?? 0;
+    if (!node || !view.hasFocus() || !view.dom.contains(node)) return view.coordsAtPos(view.state.selection.head);
+    const widget = (n: Node | undefined) => n instanceof HTMLElement && n.contentEditable === 'false';
+    while (node.nodeType === Node.ELEMENT_NODE && node.childNodes.length) {
+      const kids: NodeListOf<ChildNode> = node.childNodes;
+      const after = offset < kids.length && !(offset > 0 && widget(kids[offset]) && !widget(kids[offset - 1]));
+      node = after ? kids[offset] : kids[Math.min(offset, kids.length) - 1];
+      offset = after ? 0 : node.nodeType === Node.TEXT_NODE ? (node as Text).length : node.childNodes.length;
+    }
+    const range = view.dom.ownerDocument.createRange();
+    range.setStart(node, offset);
+    const rect = range.getClientRects()[0];
+    if (rect && (rect.top || rect.bottom)) return rect;
+    const el = node.nodeType === Node.ELEMENT_NODE ? node as Element : node.parentElement;
+    return el?.getBoundingClientRect() ?? view.coordsAtPos(view.state.selection.head);
+  }
+
   // The page the caret sits on, read one task later: called straight from the selection
   // it would lay the whole document out before anything is painted — half a second on a
   // 460-page file, thrown away by the writes of the load that follow it.
@@ -1397,27 +1488,98 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
       const tiptap = view.dom as HTMLElement | null;
       if (!tiptap) return;
       try {
-        const coords = view.coordsAtPos(view.state.selection.head);
+        // Arrow keys move the DOM caret before the state reads it in; read it in now, or
+        // the pane switch below puts the caret back where the state still has it.
+        (view as unknown as { domObserver: { flush(): void } }).domObserver.flush();
+        const coords = caretCoords(view);
         const cursorInDoc = ((coords.top + coords.bottom) / 2 - tiptap.getBoundingClientRect().top) / (appliedZoom / 100);
         currentPage = Math.max(1, Math.min(numPages, Math.floor(Math.max(0, cursorInDoc) / getCycle()) + 1));
-        followCaret(currentPage);
+        followCaret(currentPage, onPaper(coords));
       } catch { /* ignore */ }
     }, 0);
   }
 
   // The caret is drawn by whichever view holds the focus, so it has to be the one
   // whose cell shows the caret's page — otherwise it blinks on a clipped page.
-  function followCaret(page: number) {
+  function followCaret(page: number, caret: { top: number; bottom: number; left: number }) {
     if (!multiPage || hfActive) return;
-    // The two rows on screen, in page numbers — the slots alternate, so pane 0 is not
-    // reliably the first of them.
-    const top = firstRow * gridCols + 1;
-    if (page < top || page >= top + 2 * gridCols) scrollGridToPage(page);
-    const focused = paneViews.some((v) => v?.hasFocus()) || editor?.view.hasFocus();
+    showRowOf(page);
+    const focused = gridFocused();
+    if (focused) revealInGrid(page, caret);
     const pane = cells.find((c) => c.page === page)?.pane;
     if (!focused || pane === undefined || pane === activePane) return;
     activePane = pane;
     viewOf(pane)?.focus();
+  }
+
+  // Viewport coordinates as document px on the active pane's paper.
+  function onPaper(r: { top: number; bottom: number; left: number }) {
+    const origin = (papers[activePane] ?? paneView()?.dom)?.getBoundingClientRect();
+    const z = appliedZoom / 100;
+    return { top: (r.top - (origin?.top ?? 0)) / z, bottom: (r.bottom - (origin?.top ?? 0)) / z, left: (r.left - (origin?.left ?? 0)) / z };
+  }
+
+  // Scrolls to `page`'s row unless it is one of the two on screen — the slots alternate,
+  // so pane 0 is not reliably the first of them.
+  function showRowOf(page: number) {
+    const top = firstRow * gridCols + 1;
+    if (page < top || page >= top + 2 * gridCols) scrollGridToPage(page);
+  }
+
+  const gridFocused = () => paneViews.some((v) => v?.hasFocus()) || !!editor?.view.hasFocus();
+
+  // Neither ProseMirror nor the browser can scroll the caret into view here: the view
+  // drawing it may be one whose cell clips that page away. So the grid scrolls to the
+  // caret's place in its own page's cell (`caret` in document px of that page's paper).
+  function revealInGrid(page: number, caret: { top: number; bottom: number; left: number }) {
+    const el = scrollers[0];
+    const box = pageBoxes[page - 1];
+    if (!el || !canvasEl || !box) return;
+    const z = appliedZoom / 100;
+    const pad = 20;
+    const row = Math.floor((page - 1) / gridCols);
+    const y = (d: number) => canvasEl!.offsetTop + (row * firstCycle + d - box.top) * z;
+    const x = canvasEl.offsetLeft + (((page - 1) % gridCols) * pageStride + caret.left - box.left) * z;
+    const overlay = toolbarOverlay(el);
+    if (y(caret.top) < el.scrollTop + overlay) el.scrollTop = y(caret.top) - overlay - pad;
+    else if (y(caret.bottom) > el.scrollTop + el.clientHeight) el.scrollTop = y(caret.bottom) - el.clientHeight + pad;
+    if (x < el.scrollLeft) el.scrollLeft = x - pad;
+    else if (x > el.scrollLeft + el.clientWidth) el.scrollLeft = x - el.clientWidth + pad;
+    // The cells re-aim on the scroll event; the caller picks a cell by page right now.
+    readFirstRow();
+    flushSync();
+  }
+
+  // The browser pages a caret through the focused view, which clips every page but its
+  // cell's own, so the grid pages itself: the caret keeps its place on the page before
+  // or after, found in the cell that shows that page.
+  function gridPageStep(view: EditorView, dir: 1 | -1, extend: boolean): boolean {
+    const z = appliedZoom / 100;
+    const caret = onPaper(caretCoords(view));
+    const from = pageBoxes.findIndex((b) => caret.top < b.top + b.height + PAGE_GAP) + 1 || numPages;
+    const to = from + dir;
+    const { doc } = view.state;
+    let head: number | null;
+    if (to < 1 || to > numPages) {
+      head = (dir > 0 ? Selection.atEnd(doc) : Selection.atStart(doc)).head;
+    } else {
+      const a = pageBoxes[from - 1], b = pageBoxes[to - 1];
+      const shifted = { top: caret.top - a.top + b.top, bottom: caret.bottom - a.top + b.top, left: caret.left - a.left + b.left };
+      showRowOf(to);
+      revealInGrid(to, shifted);
+      const cell = cells.find((c) => c.page === to);
+      const target = cell && viewOf(cell.pane);
+      const box = cell && papers[cell.pane]?.getBoundingClientRect();
+      head = target && box
+        ? target.posAtCoords({ left: box.left + shifted.left * z, top: box.top + (shifted.top + shifted.bottom) / 2 * z })?.pos ?? null
+        : null;
+    }
+    if (head === null) return true;
+    const at = doc.resolve(head);
+    view.dispatch(view.state.tr.setSelection(extend
+      ? TextSelection.between(doc.resolve(view.state.selection.anchor), at)
+      : Selection.near(at)));
+    return true;
   }
 
   // A pane's own listeners. `scroll` does not bubble and `mouseover` needs no a11y
@@ -1425,14 +1587,19 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
   function paneEvents(node: HTMLElement, pane: number) {
     const scroll = () => onEditorScroll(pane);
     const over = (e: MouseEvent) => onEditorPointerOver(e, pane);
+    const pinch = (e: TouchEvent) => onPinch(e, pane);
     node.addEventListener('scroll', scroll);
     node.addEventListener('mouseover', over);
     node.addEventListener('mouseout', onEditorPointerOut);
+    node.addEventListener('touchstart', pinch, { passive: true });
+    node.addEventListener('touchmove', pinch, { passive: true });
     return {
       destroy() {
         node.removeEventListener('scroll', scroll);
         node.removeEventListener('mouseover', over);
         node.removeEventListener('mouseout', onEditorPointerOut);
+        node.removeEventListener('touchstart', pinch);
+        node.removeEventListener('touchmove', pinch);
       },
     };
   }
@@ -1630,7 +1797,7 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
 {/snippet}
 
 {#snippet paper(i: number, offsetTop: number, offsetLeft: number)}
-    <div bind:this={papers[i]} class="paper" data-hide-deletions={markup.hideDeletions ? '' : null} data-hide-insertions={markup.hideInsertions ? '' : null} data-plain-markup={markup.plainRevisions ? '' : null} data-hide-comments={markup.comments ? null : ''} style:position={offsetTop || offsetLeft ? 'absolute' : null} style:top={offsetTop ? `${offsetTop}px` : null} style:left={offsetLeft ? `${offsetLeft}px` : null} data-spacing-model={spacingModel} class:show-formatting-marks={showFormattingMarks} class:field-shading={showFieldShading} class:hf-editing={hfActive} class:settling style="transform: scale({appliedZoom / 100});{pageDecor.background ? ` --color-page-bg: ${pageDecor.background};` : ''}">
+    <div bind:this={papers[i]} class="paper" data-hide-deletions={markup.hideDeletions ? '' : null} data-hide-insertions={markup.hideInsertions ? '' : null} data-plain-markup={markup.plainRevisions ? '' : null} data-hide-comments={markup.comments ? null : ''} style:position={offsetTop || offsetLeft ? 'absolute' : null} style:top={offsetTop ? `${offsetTop}px` : null} style:left={offsetLeft ? `${offsetLeft}px` : null} data-spacing-model={spacingModel} data-line-grid={lineGrid.on ? '' : null} data-balance-spaces={balanceSpaces ? '' : null} style:--grid-pitch={lineGrid.on ? `${lineGrid.pitchPt}pt` : null} class:show-formatting-marks={showFormattingMarks} class:field-shading={showFieldShading} class:hf-editing={hfActive} class:settling style:--font-asian={asianDefaultFont} style:--bold-weight={asianFauxBold ? 400 : null} style:--bold-stroke={asianFauxBold ? '0.025em' : null} style="transform: scale({appliedZoom / 100});{pageDecor.background ? ` --color-page-bg: ${pageDecor.background};` : ''}">
       <!-- Dedicated mount point that TipTap fully owns — keeping it free of Svelte
            content avoids Svelte and ProseMirror fighting over the same parent's DOM. -->
       <div bind:this={hosts[i]} class="tiptap-host" data-split-pane={i > 0 ? '' : null} dir={pageRtl ? 'rtl' : null} lang={documentLanguage === NO_LANGUAGE ? null : documentLanguage} style:hyphens={hyphenate ? 'auto' : null}></div>
@@ -1683,6 +1850,7 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
         {chapterStarts}
         {pageNumbering}
         bind:zoneHeights={hfZoneHeights}
+        bind:zoneIntrusions={hfZoneIntrusions}
         interactive={i === 0}
       />
     </div>
@@ -1694,8 +1862,8 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
   {#if i === activePane}
   {#if tableUi.visible && !tableDialog}
     <TableToolbar
-      {editor}
-      {tick}
+      editor={uiEditor}
+      tick={uiTick}
       top={tableUi.top}
       left={tableUi.left}
       onDialog={(which) => (tableDialog = which)}
@@ -1706,7 +1874,7 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
       {#if tableDialog === 'split'}
         <TableSplitDialog
           onApply={(cols, rows) => {
-            editor?.chain().focus().splitCellInto(cols, rows).run();
+            uiEditor?.chain().focus().splitCellInto(cols, rows).run();
             tableDialog = null;
           }}
           onClose={() => (tableDialog = null)}
@@ -1717,7 +1885,7 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
           column={tableGrid.column}
           headerRow={tableGrid.headerRow}
           onApply={(options) => {
-            editor?.chain().focus().sortTable(options).run();
+            uiEditor?.chain().focus().sortTable(options).run();
             tableDialog = null;
           }}
           onClose={() => (tableDialog = null)}
@@ -1728,7 +1896,7 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
           initial={tableGrid.formula}
           initialFormat={tableGrid.format}
           onApply={(formula, format) => {
-            editor?.chain().focus().setCellFormula(formula, format).run();
+            uiEditor?.chain().focus().setCellFormula(formula, format).run();
             tableDialog = null;
           }}
           onClose={() => (tableDialog = null)}
@@ -1737,11 +1905,11 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
     </div>
   {/if}
   {#if imageUi.visible}
-    <ImageToolbar {editor} top={imageUi.top} left={imageUi.left} wrap={imageUi.wrap} inFront={imageUi.inFront} />
+    <ImageToolbar editor={uiEditor} top={imageUi.top} left={imageUi.left} wrap={imageUi.wrap} inFront={imageUi.inFront} />
   {/if}
   {#if textBoxUi.visible}
     <TextBoxToolbar
-      {editor}
+      editor={uiEditor}
       top={textBoxUi.top}
       left={textBoxUi.left}
       wrap={textBoxUi.wrap}
@@ -1797,14 +1965,18 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
     position: relative;
   }
 
+  /* Clip, not hidden: a hidden box still scrolls, and a caret moving to another page
+     scrolled the cell it left to show it there. */
   .page-cell {
     position: absolute;
-    overflow: hidden;
+    overflow: clip;
   }
 
-  /* Past the last page the row is short; its cell stays as the grid's empty slot. */
+  /* Past the last page the row is short; its cell stays as the grid's empty slot. Faded,
+     not hidden: rows re-aim under a focused view, and a hidden one loses the focus. */
   .page-cell.empty {
-    visibility: hidden;
+    opacity: 0;
+    pointer-events: none;
   }
 
   .split-handle {
@@ -1820,7 +1992,7 @@ import { EMPTY_PAGE_DECOR, type PageDecor } from '../storage/pageDecor';
   }
 
   /* While editing a header/footer, dim the body so focus is on the margin zone. */
-  .paper.hf-editing :global(.tiptap) {
+  .paper.hf-editing :global(.tiptap-host .tiptap) {
     opacity: 0.5;
     transition: opacity 0.15s;
   }

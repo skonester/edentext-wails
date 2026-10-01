@@ -68,6 +68,7 @@ const fixture: N = {
       T('dotted ', { type: 'underline', attrs: { lineStyle: 'dotted', lineColor: '#FF0000' } }),
       T('twice ', { type: 'underline', attrs: { lineStyle: 'double' } }),
       T('crossed ', { type: 'strike', attrs: { lineStyle: 'double' } }),
+      T('stressed ', { type: 'textStyle', attrs: { emphasis: 'dot below' } }),
       // 4pt at 16pt is a whole 25%, the unit ODF stores it in — LibreOffice rounds
       // the percentage when it re-saves, so a fractional one comes back a notch off.
       T('raised', { type: 'textStyle', attrs: { fontSize: '16pt', textPosition: 4 } }),
@@ -288,6 +289,61 @@ describe.skipIf(!SOFFICE)('LibreOffice round-trip (needs soffice on PATH)', () =
     check('LO tab: interval ≈1.27cm', Math.abs((res.tabIntervalCm ?? 0) - 1.27) < 0.01, res.tabIntervalCm);
     const stops = (res.content.content ?? [])[0]?.attrs?.tabStops;
     check('LO tab: stops + leaders survive', stops === '6l.;12r_', stops);
+  });
+
+  // Each half of the western/asian pair keeps its own slot through LibreOffice, in both
+  // formats; a run naming only its western font gains no asian one on the way.
+  it('survives a `soffice` re-save of the western/asian font pair', { timeout: 180000 }, async () => {
+    const { buildDocx } = await import('../src/lib/export/docx');
+    const { importDocx } = await import('../src/lib/import/docx');
+    const style = (attrs: N) => ({ type: 'textStyle', attrs });
+    const pairDoc: N = { type: 'doc', content: [
+      { type: 'paragraph', attrs: {}, content: [T('Word 与中文', style({ fontFamily: 'Arial', fontFamilyAsian: 'SimHei' }))] },
+      { type: 'paragraph', attrs: {}, content: [T('只有中文字体', style({ fontFamilyAsian: 'KaiTi' }))] },
+      { type: 'paragraph', attrs: {}, content: [T('Western 西方', style({ fontFamily: 'Arial' }))] },
+    ] };
+    mkdirSync('/tmp/lo-rt', { recursive: true });
+    writeFileSync('/tmp/lo-rt/pair.odt', await buildOdt(pairDoc));
+    writeFileSync('/tmp/lo-rt/pair.docx', await buildDocx(pairDoc));
+    execSync('soffice --headless --convert-to odt --outdir /tmp/lo-rt/pairout /tmp/lo-rt/pair.odt', { stdio: 'pipe', timeout: 120000 });
+    execSync('soffice --headless --convert-to docx --outdir /tmp/lo-rt/pairout /tmp/lo-rt/pair.docx', { stdio: 'pipe', timeout: 120000 });
+    const fonts = (doc: N) => (doc.content ?? []).map((b: N) => {
+      const a = b.content?.[0]?.marks?.find((m: N) => m.type === 'textStyle')?.attrs ?? {};
+      return [a.fontFamily ?? null, a.fontFamilyAsian ?? null];
+    });
+    const expected = [['Arial', 'SimHei'], [null, 'KaiTi'], ['Arial', null]];
+    const odt = importOdt(new Uint8Array(readFileSync('/tmp/lo-rt/pairout/pair.odt')));
+    check('LO pair: ODT keeps both halves', JSON.stringify(fonts(odt.content)) === JSON.stringify(expected), fonts(odt.content));
+    const docx = importDocx(new Uint8Array(readFileSync('/tmp/lo-rt/pairout/pair.docx')));
+    check('LO pair: DOCX keeps both halves', JSON.stringify(fonts(docx.content)) === JSON.stringify(expected), fonts(docx.content));
+  });
+
+  // A Chinese document written with its asian default alone comes back from LibreOffice
+  // carrying LibreOffice's western default too, and still reads as Chinese; a run keeps
+  // both of its languages.
+  it('survives a `soffice` re-save of the western/asian language pair', { timeout: 180000 }, async () => {
+    const { buildDocx } = await import('../src/lib/export/docx');
+    const { importDocx } = await import('../src/lib/import/docx');
+    const ZH = { language: 'zh', country: 'CN' };
+    const langDoc: N = { type: 'doc', content: [
+      { type: 'paragraph', attrs: {}, content: [T('这是一个中文文档。')] },
+      { type: 'paragraph', attrs: {}, content: [T('word 漢字', { type: 'textStyle', attrs: { lang: 'en-GB', langAsian: 'ja-JP' } })] },
+    ] };
+    mkdirSync('/tmp/lo-rt', { recursive: true });
+    writeFileSync('/tmp/lo-rt/langpair.odt', await buildOdt(langDoc, undefined, undefined, undefined, ZH));
+    writeFileSync('/tmp/lo-rt/langpair.docx', await buildDocx(langDoc, undefined, undefined, undefined, ZH));
+    execSync('soffice --headless --convert-to odt --outdir /tmp/lo-rt/langpairout /tmp/lo-rt/langpair.odt', { stdio: 'pipe', timeout: 120000 });
+    execSync('soffice --headless --convert-to docx --outdir /tmp/lo-rt/langpairout /tmp/lo-rt/langpair.docx', { stdio: 'pipe', timeout: 120000 });
+    for (const [kind, res] of [
+      ['ODT', importOdt(new Uint8Array(readFileSync('/tmp/lo-rt/langpairout/langpair.odt')))],
+      ['DOCX', importDocx(new Uint8Array(readFileSync('/tmp/lo-rt/langpairout/langpair.docx')))],
+    ] as const) {
+      check(`LO language pair: ${kind} reads as Chinese`, res.language === 'zh-CN', [res.language, res.languageOther]);
+      // LibreOffice lifts a run spanning its paragraph onto the paragraph.
+      const block = (res.content.content ?? [])[1];
+      const a = { ...block?.attrs, ...block?.content?.[0]?.marks?.find((m: N) => m.type === 'textStyle')?.attrs };
+      check(`LO language pair: ${kind} keeps both`, a.lang === 'en-GB' && a.langAsian === 'ja-JP', a);
+    }
   });
 
   // Needs the libreoffice-math package: without it LibreOffice silently drops every

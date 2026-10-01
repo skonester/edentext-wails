@@ -85,6 +85,36 @@ try {
   await page.waitForSelector('.tiptap', { timeout: 15_000 });
   await settled(opened);
 
+  // A language for all text rewrites every block's attrs, the blocks on both sides of each
+  // page break included; the breaks have to stay where they were, and through the undo.
+  // Kept-together paragraphs break between blocks, and a language of their own first
+  // gives clearing it something to change. Every step is undone again after.
+  const breaks = () => page.evaluate(() => Array.from(document.querySelectorAll('[data-page-break-spacer]'),
+    (s) => Math.round(s.getBoundingClientRect().top)).join(','));
+  const relabel = async (how) => { await page.evaluate(how); await page.waitForTimeout(1500); return breaks(); };
+  const undo = () => document.querySelector('.tiptap').editor.commands.undo();
+  const breaksKept = await relabel(() => document.querySelector('.tiptap').editor.chain()
+    .selectAll().updateAttributes('paragraph', { keepLines: true }).setTextSelection(1).run());
+  const breaksLabelled = await relabel(() => document.querySelector('.tiptap').editor.chain()
+    .selectAll().setBlockLanguage('fr-FR').setTextSelection(1).run());
+  // The caret stays at the top, and the view scrolled away from it stays where it is.
+  const scrolled = () => page.evaluate(() => Math.round(document.querySelector('.editor').scrollTop));
+  await page.evaluate(() => { const ed = document.querySelector('.editor'); ed.scrollTop = ed.scrollHeight; });
+  const scrollBefore = await scrolled();
+  await page.locator('.statusbar .lang-picker select').selectOption('doc:de');
+  await page.waitForTimeout(300);
+  const scrollAfter = await scrolled();
+  await page.evaluate(() => { document.querySelector('.editor').scrollTop = 0; });
+  const breaksCleared = await relabel(() => {});
+  const breaksUndone = await relabel(undo);
+  check(breaksKept.includes(',') && [breaksLabelled, breaksCleared, breaksUndone].every((b) => b === breaksKept),
+    `a language for all text keeps the page breaks (${breaksKept} → ${breaksLabelled} → ${breaksCleared} → ${breaksUndone})`);
+  check(scrollBefore > 0 && scrollAfter === scrollBefore,
+    `a language for all text leaves the view where it was (scrollTop ${scrollBefore} → ${scrollAfter})`);
+  await page.evaluate(undo);
+  await page.evaluate(undo);
+  await settled(opened);
+
   // The caret is placed through the editor: a click lands wherever the element's centre
   // happens to be. The focus itself arrives on the next animation frame, so a key sent
   // before it is lost — wait for it.
@@ -264,7 +294,7 @@ try {
     `typing at the top of a ${longPages}-page document: ${keyMedian} ms per keystroke (p90 ${keyP90}, max ${keyMax}, budget ${BUDGET}), ${Math.round(pass)} ms pass after a split`);
   // A letter typed and taken back leaves every block as tall as it was, so no pass runs
   // (a pass that moves something ends in a pm-pagecount event), and the pause costs no more
-  // than a key: the spell checker re-reads the edited paragraph, not the document.
+  // than a key (the engine's budget): the spell checker re-reads the edited paragraph only.
   await page.evaluate(() => {
     window.__passes = 0;
     document.querySelector('.tiptap').addEventListener('pm-pagecount', () => { window.__passes++; });
@@ -275,7 +305,7 @@ try {
   let idle = 0;
   for (const until = Date.now() + 1500; Date.now() < until;) idle = Math.max(idle, await blocked());
   const passes = await page.evaluate(() => window.__passes);
-  check(passes === 0 && idle < 100,
+  check(passes === 0 && idle < BUDGET,
     `a letter typed and taken back runs no pass and its pause is free (${passes} passes, ${Math.round(idle)} ms blocked at most)`);
 
   // A pass that lands the layout the last one did announces nothing: every reader of the
@@ -306,10 +336,32 @@ try {
   await page.reload({ waitUntil: 'load' });
   await page.waitForSelector('.tiptap', { timeout: 15_000 });
   await settle(page, true);
-  const bands = await page.evaluate(() => Array.from(document.querySelectorAll('.tiptap > p'),
+  const bands = await page.evaluate(() => Array.from(document.querySelectorAll('.tiptap-host .tiptap > p'),
     (p) => `${p.getAttribute('data-wrap-band') ?? '-'}/${getComputedStyle(p).clear}`).join(' '));
   check(bands === '-/none true/none -/both anchored/none -/none true/none true/none -/both',
     `loaded from the autosave, the block after a band frame clears it, after an anchored one it does not (${bands})`);
+
+  // An index shows the rows it saved, as both word processors do, until it is updated.
+  const heading = (t) => ({ type: 'heading', attrs: { level: 1 }, content: [words(t)] });
+  await page.evaluate((d) => localStorage.setItem('edentext-doc', JSON.stringify(d)), { type: 'doc', content: [
+    { type: 'tableOfContents', attrs: { title: '', entries: [{ text: 'Two', level: 1, page: 9 }, { text: 'Gone', level: 1, page: 7 }] } },
+    heading('One'), heading('Two'),
+  ] });
+  await page.reload({ waitUntil: 'load' });
+  await page.waitForSelector('.toc-entry', { timeout: 15_000 });
+  await settle(page, true);
+  const tocRows = () => page.evaluate(() => Array.from(document.querySelectorAll('.toc-entry'),
+    (r) => `${r.querySelector('.toc-text').textContent} ${r.querySelector('.toc-page').textContent}`).join(', '));
+  const cachedRows = await tocRows();
+  // Word's other choice: the saved rows stay, their page numbers are renewed.
+  await page.evaluate(() => document.querySelector('.tiptap').editor.commands.updateIndexes('pages'));
+  await settle(page, true);
+  const renumbered = await tocRows();
+  await page.evaluate(() => document.querySelector('.tiptap').editor.commands.updateIndexes());
+  await settle(page, true);
+  const updated = await tocRows();
+  check(cachedRows === 'Two 9, Gone 7' && renumbered === 'Two 1, Gone 7' && updated === 'One 1, Two 1',
+    `an index keeps its saved rows until updated (${cachedRows} → ${renumbered} → ${updated})`);
 
   // A two-column section over several pages pages in one pass: a continuation is judged
   // with a full page wherever it renders, and the split counts the blocks' margins as the
@@ -328,7 +380,7 @@ try {
   await page.reload({ waitUntil: 'load' });
   await page.waitForSelector('.tiptap', { timeout: 15_000 });
   await settle(page, true);
-  const flow = await page.evaluate(() => ({ passes: window.__passes, fragments: document.querySelectorAll('.tiptap > .columns-node').length }));
+  const flow = await page.evaluate(() => ({ passes: window.__passes, fragments: document.querySelectorAll('.tiptap-host .tiptap > .columns-node').length }));
   check(flow.fragments >= 3 && flow.passes <= 8,
     `a two-column section over ${flow.fragments} pages settles in ${flow.passes} passes`);
 
@@ -340,7 +392,7 @@ try {
     null, { timeout: 30_000 });
   await settle(page, true);
   // The block itself, by its text: the style change turns the h1 into an h3.
-  await page.evaluate(() => { window.__heading = () => Array.from(document.querySelectorAll('.tiptap > *'))
+  await page.evaluate(() => { window.__heading = () => Array.from(document.querySelectorAll('.tiptap-host .tiptap > *'))
     .find((e) => e.textContent.startsWith('Portrait first')); });
   const inset = await page.evaluate(() => {
     const el = window.__heading();
@@ -369,7 +421,7 @@ try {
   await page.reload({ waitUntil: 'load' });
   await page.waitForSelector('.tiptap img', { timeout: 15_000 });
   await settle(page, true);
-  const paraHeight = () => page.evaluate(() => document.querySelector('.tiptap > p').getBoundingClientRect().height);
+  const paraHeight = () => page.evaluate(() => document.querySelector('.tiptap-host .tiptap > p').getBoundingClientRect().height);
   const frameBox = () => page.evaluate(() => {
     const el = document.querySelector('.image-node');
     const r = el.getBoundingClientRect();
@@ -399,16 +451,18 @@ try {
     `a frame out of the flow is dragged by its own offsets (moved ${dx}/${dy}, wanted 60/40)`);
 
   // A text box in that mode moves the same way, but by its frame ring — its own drag
-  // is ProseMirror's node move, which would re-anchor it instead.
+  // is ProseMirror's node move, which would re-anchor it instead. Past the autosave's
+  // debounce, or its write puts the dragged picture back in the text box's place.
+  await page.waitForTimeout(1500);
   await page.evaluate((d) => localStorage.setItem('edentext-doc', JSON.stringify(d)), { type: 'doc', content: [
     block(words('before the box '), { type: 'textBox', attrs: { width: 200, height: 80, wrap: 'through' },
       content: [block(words('in the box'))] }, words(' after it')),
   ] });
   await page.reload({ waitUntil: 'load' });
-  await page.waitForSelector('.tiptap .image-node[data-wrap="through"]', { timeout: 15_000 });
+  await page.waitForSelector('.tiptap .textbox-node[data-wrap="through"]', { timeout: 15_000 });
   await settle(page, true);
   const boxAt = () => page.evaluate(() => {
-    const r = document.querySelector('.tiptap .image-node[data-wrap="through"]').getBoundingClientRect();
+    const r = document.querySelector('.tiptap .textbox-node[data-wrap="through"]').getBoundingClientRect();
     return { x: r.left, y: r.top };
   });
   const boxBefore = await boxAt();
@@ -530,7 +584,8 @@ try {
   await settle(page, true);
   await page.selectOption('.statusbar .lang-picker select', 'doc:en');
   await page.check('.statusbar .gr-toggle input');
-  const squiggle = await page.waitForSelector('.tiptap .pm-grammar-error', { timeout: 60_000 })
+  // The waves are CSS highlight ranges (grammarCheck.ts), not elements.
+  const squiggle = await page.waitForFunction(() => CSS.highlights.get('grammar-error')?.size > 0, null, { timeout: 60_000 })
     .then(() => true).catch(() => false);
   check(squiggle, 'the grammar check flags a wrong sentence in the browser');
 
@@ -538,14 +593,14 @@ try {
   // what the hyphenation and the browser's own spell check read.
   await page.evaluate(() => document.querySelector('.tiptap').editor.commands.setContent(
     '<p>He go to the store.</p><p>Er geht zum Laden zum Laden.</p>'));
-  await page.waitForFunction(() => document.querySelectorAll('.tiptap .pm-grammar-error').length > 0,
+  await page.waitForFunction(() => CSS.highlights.get('grammar-error')?.size > 0,
     null, { timeout: 30_000 }).catch(() => {});
   await page.evaluate(() => {
     const ed = document.querySelector('.tiptap').editor;
     ed.commands.setTextSelection(ed.state.doc.content.size - 2);
   });
   await page.selectOption('.statusbar .lang-picker select', 'sel:de');
-  const langs = await page.evaluate(() => [...document.querySelectorAll('.tiptap > p')].map((p) => p.getAttribute('lang')));
+  const langs = await page.evaluate(() => [...document.querySelectorAll('.tiptap-host .tiptap > p')].map((p) => p.getAttribute('lang')));
   check(JSON.stringify(langs) === '[null,"de-DE"]', `only the second paragraph takes a language (${JSON.stringify(langs)})`);
   const paragraphToggleOff = await page.waitForFunction(() => {
     const input = document.querySelector('.statusbar .gr-toggle input');
@@ -553,10 +608,10 @@ try {
   }, null, { timeout: 5_000 }).then(() => true).catch(() => false);
   check(paragraphToggleOff, 'a non-English paragraph disables and clears the grammar toggle');
   // Harper reads German as broken English; the block language is what keeps it out.
-  await page.waitForFunction(() => document.querySelectorAll('.tiptap .pm-grammar-error').length > 0,
+  await page.waitForFunction(() => CSS.highlights.get('grammar-error')?.size > 0,
     null, { timeout: 30_000 }).catch(() => {});
-  const perPara = await page.evaluate(() =>
-    [...document.querySelectorAll('.tiptap > p')].map((p) => p.querySelectorAll('.pm-grammar-error').length));
+  const perPara = await page.evaluate(() => [...document.querySelectorAll('.tiptap-host .tiptap > p')].map((p) =>
+    [...CSS.highlights.get('grammar-error') ?? []].filter((r) => p.contains(r.startContainer)).length));
   check(perPara[0] > 0 && perPara[1] === 0, `only the English paragraph is grammar-checked (${JSON.stringify(perPara)})`);
 
   // The default can be Portuguese while an English paragraph still gets grammar checks.
@@ -576,9 +631,106 @@ try {
     return !input?.disabled && input?.checked;
   }, null, { timeout: 5_000 }).then(() => true).catch(() => false);
   check(englishToggleOn, 'an English paragraph restores the grammar toggle');
-  await page.waitForFunction(() => document.querySelector('.tiptap > p .pm-grammar-error'), null, { timeout: 30_000 })
+  await page.waitForFunction(() => [...CSS.highlights.get('grammar-error') ?? []].some((r) =>
+    r.startContainer.isConnected && r.startContainer.parentElement?.closest('.tiptap-host .tiptap > p')), null, { timeout: 30_000 })
     .then(() => check(true, 'an English paragraph in a Portuguese document is grammar-checked'))
     .catch(() => check(false, 'an English paragraph in a Portuguese document is grammar-checked'));
+
+  // The page grid: every cell is a fixed window of exactly its own page, and the caret —
+  // drawn only by the focused view, clipped to its cell — follows whatever moves it.
+  // Last, since it replaces the document and the zoom with its own.
+  await page.evaluate(() => localStorage.setItem('edentext-page-columns', '3'));
+  await page.reload({ waitUntil: 'load' });
+  await page.waitForSelector('.page-cell', { timeout: 15_000 });
+  await page.evaluate(() => {
+    const text = 'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor. ';
+    document.querySelector('.tiptap').editor.commands.setContent({ type: 'doc', content: Array.from({ length: 300 },
+      (_, i) => ({ type: 'paragraph', content: [{ type: 'text', text: `${i + 1}. ${text.repeat(1 + (i % 4))}` }] })) });
+  });
+  const gridPages = await settled();
+  const gridState = (scrolledAway) => page.evaluate((scrolledAway) => {
+    const bad = [];
+    const near = (a, b) => Math.abs(a - b) < 1.5;
+    const sheetAt = (c) => {
+      const r = c.getBoundingClientRect();
+      return [...c.querySelectorAll('.page-sheet')].findIndex((s) => {
+        const q = s.getBoundingClientRect();
+        return near(q.top, r.top) && near(q.left, r.left) && near(q.width, r.width) && near(q.height, r.height);
+      }) + 1;
+    };
+    const live = [...document.querySelectorAll('.page-cell:not(.empty)')];
+    const pages = live.map(sheetAt);
+    if (pages.includes(0)) bad.push(`a cell shows no whole page (${pages})`);
+    if (new Set(pages).size !== pages.length) bad.push(`a page shows twice (${pages})`);
+    const cell = document.activeElement?.closest('.page-cell');
+    const sel = getSelection();
+    if (!cell || !sel.rangeCount) return [...bad, 'no cell has the focus'];
+    // Measured in the text: a range between elements measures the spacer before it.
+    let node = sel.focusNode, offset = sel.focusOffset;
+    const widget = (n) => n?.nodeType === 1 && n.contentEditable === 'false';
+    while (node.nodeType === 1 && node.childNodes.length) {
+      const kids = node.childNodes;
+      const after = offset < kids.length && !(offset > 0 && widget(kids[offset]) && !widget(kids[offset - 1]));
+      node = after ? kids[offset] : kids[Math.min(offset, kids.length) - 1];
+      offset = after ? 0 : node.nodeType === 3 ? node.length : node.childNodes.length;
+    }
+    const range = document.createRange();
+    range.setStart(node, offset);
+    let rect = range.getClientRects()[0];
+    if (!rect || !(rect.top || rect.bottom)) rect = (node.nodeType === 1 ? node : node.parentElement).getBoundingClientRect();
+    const y = (rect.top + rect.bottom) / 2;
+    const r = cell.getBoundingClientRect();
+    const drawn = y >= r.top - 1 && y <= r.bottom + 1 && rect.left >= r.left - 1 && rect.left <= r.right + 1;
+    const page = [...cell.querySelectorAll('.page-sheet')].findIndex((s) => {
+      const q = s.getBoundingClientRect();
+      return y >= q.top - 12 && y <= q.bottom + 12;
+    }) + 1;
+    if (!drawn && pages.includes(page)) bad.push(`the caret on page ${page} is clipped away in the cell of page ${sheetAt(cell)}`);
+    const view = document.querySelector('.editor-panes.grid > .editor').getBoundingClientRect();
+    if (!scrolledAway && (!drawn || y < view.top || y > view.bottom)) bad.push(`the caret is off screen (${Math.round(y)})`);
+    return bad;
+  }, scrolledAway);
+  const gridFaults = [];
+  // Layout settles over a few frames, so the invariant gets until the settle is over.
+  const gridStep = async (label, scrolledAway = false) => {
+    let faults = [];
+    for (let i = 0; i < 6 && (i === 0 || faults.length); i++) {
+      await page.waitForTimeout(350);
+      faults = await gridState(scrolledAway);
+    }
+    for (const fault of faults) gridFaults.push(`${label}: ${fault}`);
+  };
+  const docEnd = process.platform === 'darwin' ? 'Meta+ArrowDown' : 'Control+End';
+  const docStart = process.platform === 'darwin' ? 'Meta+ArrowUp' : 'Control+Home';
+  await page.locator('.page-cell:not(.empty) .tiptap p').first().click();
+  await gridStep('click');
+  await page.keyboard.press(docEnd);
+  await gridStep('document end');
+  await page.keyboard.type('x');
+  await gridStep('typing');
+  await page.keyboard.press(docStart);
+  await gridStep('document start');
+  for (let i = 1; i <= 4; i++) {
+    await page.keyboard.press('PageDown');
+    await gridStep(`page down ${i}`);
+  }
+  for (let i = 0; i < 60; i++) await page.keyboard.press('ArrowDown');
+  await gridStep('arrow down');
+  await page.keyboard.press(`${MOD}+Enter`);
+  await gridStep('page break');
+  await page.keyboard.press('Backspace');
+  await gridStep('page break removed');
+  await page.mouse.move(700, 500);
+  for (let i = 1; i <= 3; i++) {
+    await page.mouse.wheel(0, 600);
+    await gridStep(`wheel ${i}`, true);
+  }
+  await page.keyboard.type('y');
+  await gridStep('typing after scrolling away');
+  await page.keyboard.press('PageUp');
+  await gridStep('page up');
+  check(gridPages > 6 && gridFaults.length === 0,
+    `the page grid shows each page in its own cell and the caret where it is (${gridPages} pages${gridFaults.length ? `: ${gridFaults.join('; ')}` : ''})`);
 
 } catch (err) {
   check(false, `dom run threw: ${err.message ?? err}`);

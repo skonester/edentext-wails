@@ -37,6 +37,8 @@ export type ParaProps = {
 
 export type TextProps = {
   fontFamily?: string;
+  // The font for Chinese, Japanese and Korean text (ODF font-name-asian, Word w:eastAsia).
+  fontFamilyAsian?: string;
   fontSizePt?: number;
   letterSpacingPt?: number; // character spacing (Word's w:spacing, ODF fo:letter-spacing)
   // Pair kerning. Both states are stored: a style inherits its parent's, so a heading
@@ -48,9 +50,10 @@ export type TextProps = {
   strike?: boolean;
   color?: string;
   caps?: CapsMode; // all caps / small caps (Word w:caps + w:smallCaps, ODF fo:text-transform)
-  // A language tag ('en-US'). Carried here so a paragraph's language can be baked onto
-  // its runs, which is the only place Word reads one from.
+  // Language tags ('en-US'), western and asian. Carried here so a paragraph's languages
+  // can be baked onto its runs, which is the only place Word reads one from.
   lang?: string;
+  langAsian?: string;
 };
 
 export type Style = {
@@ -250,22 +253,122 @@ export function cssFontFamily(name: string): string {
   return `"${cssString(name)}", var(--font-serif)`;
 }
 
-// Single spacing is the font's *natural* line height, so it differs per family.
-// Liberation Serif's 1.15 is the default (editor.css); only the bundled families that
-// deviate are listed, measured against LibreOffice at 12pt.
-const DEFAULT_SINGLE_LINE_HEIGHT = 1.15;
-const SINGLE_LINE_HEIGHT: Record<string, number> = {
-  Calibri: 1.2208,
-  'Calibri Light': 1.2208,
-  Carlito: 1.2208,
-  'Courier New': 1.1333,
-  'Liberation Mono': 1.1333,
+// What a family's substitute does differently, one row per family. `stack`: the names it
+// renders under; `sans`: Arial's generic tail; `singleLine`: its natural line height (1.15
+// is Liberation Serif's, editor.css), measured against LibreOffice at 12pt.
+// `noBold`: Word has no bold face and strokes the regular outline 0.025em (read from its PDF),
+// heavier than a substitute's own bold. `wideQuotes`: full-width quotation marks, as the
+// Chinese face sets them, from `EdenText Quotes` where the face is missing.
+interface FontProfile {
+  stack?: string;
+  sans?: boolean;
+  singleLine?: number;
+  noBold?: boolean;
+  wideQuotes?: boolean;
+}
+const SANS = { stack: "'Arial', 'Liberation Sans'", sans: true };
+// Measured in Word: 22pt SimSun at 1.15 sets 32.9pt lines. It sets FangSong_GB2312 in
+// SimSun where the font is missing, and LibreOffice's fallback measures 1.34.
+const SONG = { singleLine: 1.3, noBold: true, wideQuotes: true };
+const CJK_NO_BOLD = { noBold: true, wideQuotes: true };
+const SEGOE = { singleLine: 1.33 };
+const line = (singleLine: number) => ({ singleLine });
+const FONT_PROFILES: Record<string, FontProfile> = {
+  'Liberation Serif': { stack: "'Liberation Serif', 'Times New Roman'" },
+  'Liberation Sans': SANS,
+  Arial: SANS,
+  Calibri: { singleLine: 1.2208 },
+  'Calibri Light': { singleLine: 1.2208 },
+  Carlito: { singleLine: 1.2208 },
+  // Word sets Segoe UI's win metrics, (2210 + 514) / 2048; Selawik, its open stand-in, shares them.
+  'Segoe UI': SEGOE, 'Segoe UI Semibold': SEGOE, 'Segoe UI Semilight': SEGOE, 'Segoe UI Light': SEGOE,
+  'Segoe UI Black': SEGOE, Selawik: SEGOE,
+  // Office faces often missing where the file is opened, as Word sets them: win ascent +
+  // descent + the hhea gap they leave out, read from the fonts Word ships.
+  Cambria: line(1.1724), Caladea: line(1.1724), Aptos: line(1.2847), Consolas: line(1.1709),
+  Candara: line(1.2207), Constantia: line(1.2207), Corbel: line(1.2207), Tahoma: line(1.207),
+  Verdana: line(1.2153), Georgia: line(1.1362), 'Trebuchet MS': line(1.1611),
+  'Century Gothic': line(1.2261), Garamond: line(1.125), 'Book Antiqua': line(1.2427),
+  'Palatino Linotype': line(1.3491), 'Lucida Sans Unicode': line(1.5366),
+  'Microsoft YaHei': line(1.3198), 'Malgun Gothic': line(1.3301),
+  'Courier New': { singleLine: 1.1333 },
+  'Liberation Mono': { singleLine: 1.1333 },
+  SimSun: SONG, 宋体: SONG, NSimSun: SONG, 新宋体: SONG, FangSong: SONG, 仿宋: SONG, 仿宋_GB2312: SONG,
+  FangSong_GB2312: CJK_NO_BOLD, SimHei: CJK_NO_BOLD, 黑体: CJK_NO_BOLD, KaiTi: CJK_NO_BOLD,
+  KaiTi_GB2312: CJK_NO_BOLD, 楷体: CJK_NO_BOLD, 楷体_GB2312: CJK_NO_BOLD, MingLiU: CJK_NO_BOLD,
+  PMingLiU: CJK_NO_BOLD, 細明體: CJK_NO_BOLD, 新細明體: CJK_NO_BOLD, 'MS Mincho': CJK_NO_BOLD,
+  'MS PMincho': CJK_NO_BOLD, 'MS Gothic': CJK_NO_BOLD, 'MS PGothic': CJK_NO_BOLD,
 };
+
+// A family named in Han is a Chinese face all the same.
+function fontProfile(name: string): FontProfile {
+  return FONT_PROFILES[name] ?? (/\p{sc=Han}/u.test(name) ? { wideQuotes: true } : {});
+}
+
+export function fauxBold(asian: string): boolean {
+  return !!fontProfile(asian).noBold;
+}
+
+function westNames(name: string): string {
+  const p = fontProfile(name);
+  return (p.stack ?? `"${cssString(name)}"`) + (p.wideQuotes ? ", 'EdenText Quotes'" : '');
+}
+
+// Text takes the western font, then the asian one, then the western family's generic tail
+// (last, so `serif` cannot catch Han text first), each a variable inheriting on its own, and
+// a balanced document's --font-space before all three. Named halves are spelled out too.
+export function fontPairDeclarations(west?: string | null, asian?: string | null): string[] {
+  if (!west && !asian) return [];
+  const out: string[] = [];
+  const tail = `var(${west && fontProfile(west).sans ? '--font-heading' : '--font-serif'})`;
+  if (west) out.push(`--font-west: ${westNames(west)}`, `--font-tail: ${tail}`);
+  if (asian) {
+    out.push(`--font-asian: "${cssString(asian)}"`);
+    out.push(...(fauxBold(asian) ? ['--bold-weight: 400', '--bold-stroke: 0.025em'] : ['--bold-weight: 700', '--bold-stroke: 0']));
+  }
+  out.push(`font-family: var(--font-space,) ${[
+    west ? westNames(west) : 'var(--font-west)',
+    asian ? `"${cssString(asian)}"` : 'var(--font-asian, var(--font-tail))',
+    west ? tail : 'var(--font-tail)',
+  ].join(', ')}`);
+  return out;
+}
 
 // A proportional line spacing multiplies the font's natural line height, while CSS
 // multiplies the font size — so the stored factor is scaled by the family's own.
 export function singleLineHeight(fontFamily?: string): number {
-  return (fontFamily && SINGLE_LINE_HEIGHT[fontFamily]) || DEFAULT_SINGLE_LINE_HEIGHT;
+  return (fontFamily && (FONT_PROFILES[fontFamily]?.singleLine ?? measuredLine(fontFamily))) || 1.15;
+}
+
+// Any other installed family: Chromium's `line-height: normal` (hhea), Word's win line where
+// they agree; a missing family measures as its fallback and keeps the default.
+// ponytail: cached once, so a face registered later (embedded, on reload) keeps the fallback's.
+const measured = new Map<string, number>();
+function measuredLine(name: string): number {
+  if (typeof document === 'undefined' || !document.body) return 0;
+  let v = measured.get(name);
+  if (v == null) {
+    const probe = (family: string) => {
+      const el = document.createElement('div');
+      el.style.cssText = `position:absolute;visibility:hidden;font:1000px ${family};line-height:normal`;
+      el.textContent = 'x';
+      document.body.append(el);
+      const h = el.getBoundingClientRect().height;
+      el.remove();
+      return h;
+    };
+    const own = probe(`"${cssString(name)}", serif`);
+    v = own > 0 && own !== probe('serif') && Math.abs(own - 1150) > 1 ? Math.round(own * 10) / 10000 : 0;
+    measured.set(name, v);
+  }
+  return v;
+}
+
+// A line spacing as editor.css reads it: a factor of the font's natural line, or a fixed
+// height in pt (Word's "exactly", ODF's fo:line-height length). Each clears the other,
+// so a paragraph's own spacing beats its style's of either kind.
+export function lineSpacingDeclarations(value: string): string[] {
+  return /pt$/.test(value) ? [`--line-fixed: ${value}`, '--line-factor: 1'] : [`--line-factor: ${value}`, '--line-fixed: initial'];
 }
 
 // The text half of a rule, shared with the table-style family (tableStyles.ts). A block
@@ -273,15 +376,17 @@ export function singleLineHeight(fontFamily?: string): number {
 // paragraph's spacing factor; a run box sets its line height outright.
 export function textDeclarations(t: TextProps, asBlock = false): string[] {
   const out: string[] = [];
+  out.push(...fontPairDeclarations(t.fontFamily, t.fontFamilyAsian));
   if (t.fontFamily) {
-    out.push(`font-family: ${cssFontFamily(t.fontFamily)}`);
-    const lh = SINGLE_LINE_HEIGHT[t.fontFamily];
-    if (lh) out.push(`${asBlock ? '--natural-line' : 'line-height'}: ${lh}`);
+    const lh = singleLineHeight(t.fontFamily);
+    if (lh !== 1.15) out.push(`${asBlock ? '--natural-line' : 'line-height'}: ${lh}`);
   }
   if (t.fontSizePt != null) out.push(`font-size: ${t.fontSizePt}pt`);
   if (t.letterSpacingPt) out.push(`letter-spacing: ${t.letterSpacingPt}pt`);
   if (t.kerning != null) out.push(`font-kerning: ${t.kerning ? 'normal' : 'none'}`);
-  if (t.bold != null) out.push(`font-weight: ${t.bold ? 700 : 400}`);
+  if (t.bold != null) {
+    out.push(`font-weight: ${t.bold ? 'var(--bold-weight, 700)' : 400}`, `-webkit-text-stroke-width: ${t.bold ? 'var(--bold-stroke, 0)' : 0}`);
+  }
   if (t.italic != null) out.push(`font-style: ${t.italic ? 'italic' : 'normal'}`);
   if (t.underline || t.strike) {
     out.push(`text-decoration: ${[t.underline && 'underline', t.strike && 'line-through'].filter(Boolean).join(' ')}`);
@@ -296,7 +401,7 @@ function declarations(r: ResolvedStyle): string[] {
   const { para: p } = r;
   const out = textDeclarations(r.text, true);
   if (p.textAlign) out.push(`text-align: ${p.textAlign}`);
-  if (p.lineHeight) out.push(`--line-factor: ${p.lineHeight}`);
+  if (p.lineHeight) out.push(...lineSpacingDeclarations(p.lineHeight));
   // Padding or margin per the document's spacing model — editor.css resolves it.
   if (p.spaceBefore != null) out.push(`--space-before: ${p.spaceBefore}pt`);
   // The property beside it is what the multi-column rule turns the space below into.
@@ -332,15 +437,21 @@ export function styleCss(sheet: StyleSheet): string {
     rules.push(`.paper .tiptap ${attr} {\n  ${decls.join(';\n  ')};\n}`);
   }
   for (const style of Object.values(sheet.paragraph)) {
-    const decls = declarations(resolveStyle(sheet, style.name));
+    const resolved = resolveStyle(sheet, style.name);
+    const decls = declarations(resolved);
+    // A character indent counts in the style's size, whatever the block's own mark or
+    // runs say (probed in LibreOffice); indent.ts reads it.
+    if (resolved.text.fontSizePt != null) decls.push(`--char-unit: ${resolved.text.fontSizePt}pt`);
     if (!decls.length) continue;
     const attr = `[data-style="${cssString(style.name)}"]`;
     const selectors = [`.paper .tiptap ${attr}`];
     if (style.outlineLevel) selectors.push(`.paper .tiptap h${style.outlineLevel}:not([data-style])`);
     if (style.outlineLevel === 1) selectors.push('.paper .tiptap .toc-title'); // the index heads its list like any chapter
     // The generated index carries no style name, and a word processor bases its own
-    // index styles on the default one — so it follows the document's body text.
-    if (style.name === DEFAULT_STYLE) selectors.push('.paper .tiptap p:not([data-style])', '.paper .tiptap .toc');
+    // index styles on the default one — so it follows the document's body text. A
+    // header/footer zone takes the style's text half alone (below), as its importers bake
+    // the rest in; :where keeps the selector's weight what it was.
+    if (style.name === DEFAULT_STYLE) selectors.push('.paper .tiptap p:not([data-style]):where(:not(.hf-zone *))', '.paper .tiptap .toc');
     rules.push(`${selectors.join(',\n')} {\n  ${decls.join(';\n  ')};\n}`);
 
     // A list marker inherits the item's own font, never its paragraph's, so the item
@@ -353,8 +464,9 @@ export function styleCss(sheet: StyleSheet): string {
       items.push('.paper .tiptap li:has(> p:not([data-style]))');
       // A header/footer zone is a paragraph of the file too, and both formats base its
       // style on the default one — without this it renders in the editor's own font.
-      // The off-screen copy the band is measured from has to match it exactly.
-      items.push('.paper .hf-layer .hf-zone', '.paper .hf-measure .hf-zone');
+      // The off-screen editor the band is measured from gets it too.
+      // On the zone's editor itself, over the font `.paper .tiptap` sets there.
+      items.push('.paper .hf-zone .tiptap.ProseMirror');
     }
     rules.push(`${items.join(',\n')} {\n  ${text.join(';\n  ')};\n}`);
   }
@@ -403,6 +515,7 @@ export function propsFromBlock(node: BlockNode, marks: BlockMark[] = []): Resolv
     else if (name === 'textStyle') {
       const attrs = mark.attrs ?? {};
       if (typeof attrs.fontFamily === 'string' && attrs.fontFamily) text.fontFamily = attrs.fontFamily;
+      if (typeof attrs.fontFamilyAsian === 'string' && attrs.fontFamilyAsian) text.fontFamilyAsian = attrs.fontFamilyAsian;
       if (typeof attrs.fontSize === 'string' && attrs.fontSize) text.fontSizePt = parseFloat(attrs.fontSize);
       if (typeof attrs.color === 'string' && attrs.color) text.color = attrs.color;
       if (attrs.fontWeight === 'normal') text.bold = false;

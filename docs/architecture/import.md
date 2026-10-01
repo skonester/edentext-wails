@@ -58,18 +58,36 @@ page breaks apply to list paragraphs but not table-cell paragraphs.
 Master-page changes open document sections. Read page setup, headers, footers, edge distances,
 first-page and left/right variants from the governing master, and calculate content width per
 section. An explicit empty master-page name means no change. A left/right master pair represents
-mirrored layout; distinguish it from a first-page hand-over.
+mirrored layout; distinguish it from a first-page hand-over. Naming the current master again
+opens a new section only where that restarts something — a hand-over to a successor, or a
+`page-usage` side demand — which is how a book reopens Chapter Intro for every chapter.
 
 Header/footer body reach is the rendered zone height plus applicable gap, respecting dynamic
 spacing, wrapped content, and internal paragraph spacing. A trailing zone margin does not add
-to the reach. Import zone content into its restricted schema, dropping unknown marks and keeping
-recoverable text.
+to the reach. Both importers convert a zone with the body's block converter under a `'zone'`
+kind: its lists, tables, text boxes and frames keep their structure, page fields become live
+atoms anywhere in it (cells and boxes too), other fields keep their cached result, and notes,
+comments and revisions are left out. A zone paragraph carries no style name and bakes its
+Header/Footer style in, as a cell paragraph does. A frame's x measured from the page edge is
+kept against the text column, which is how both exporters write it back.
 
 ## DOCX compatibility
 
 Use the default paragraph style and named style chain as the DOCX yardstick. Word's `Normal`
 maps to the registry default even if its display name differs. A heading can be identified by
-outline level as well as style name, and must never become a list item.
+outline level as well as style name, and must never become a list item. WPS repeats the chapter
+numbering's `w:numPr` on every heading paragraph; that stays chapter numbering, and where the
+heading style carries none, the first heading of a level supplies it. Chapter numbering takes
+every list format, the CJK ones included.
+
+A nonzero `w:beforeLines`/`w:afterLines` wins over `w:before`/`w:after`, as in Word, at 12pt a
+line. LibreOffice keeps the twips when both are written, which WPS does (`w:after="0"
+w:afterLines="100"`), so there the editor follows Word, not LibreOffice.
+A `wrapNone` picture aligned in the column (`wp:align` against `margin`/`column`), or an ODF
+`run-through` one by `style:horizontal-pos` against its paragraph or `page-content`, becomes
+the x that alignment gives, since nothing floats a run-through frame to a side.
+An ODF frame aligned `left`/`top` against the `page` is offset 0 from the page's corner
+(`wrapFromPage`), how a header carries a cover picture filling the first sheet.
 
 Resolve table borders and conditional table-style areas before baking them into cells, because
 the editor registry does not retain file table styles. Honor compatibility mode when interpreting
@@ -84,7 +102,9 @@ link-to-previous behavior, while a present empty part deliberately clears the zo
 ## Feature mapping
 
 Map paragraphs, headings, lists, tables, inline content, fields, and frames to their semantic
-editor nodes. Keep fields' cached values where the editor cannot recalculate them. Text boxes,
+editor nodes. Keep fields' cached values where the editor cannot recalculate them. An index
+keeps its cached rows (text, level from the row's entry style, page numbers after the last
+tab) as its entries: both word processors show those until the reader updates it. Text boxes,
 shapes, charts, formulas, bookmarks, cross-references, ruby, bibliography, revisions, notes,
 and placeholders have focused mappings in their architecture documents.
 

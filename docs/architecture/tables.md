@@ -137,7 +137,22 @@ We deliberately keep TipTap's `resizable: false` (so its own columnResizing plug
   The excess comes off the cell's `padding-bottom` (`--border-over`, `tableCellBorders.ts`;
   the bottom side only, since `border-collapse` draws one line per boundary), which is why the
   cell padding rides four custom properties rather than one shorthand. 0.25mm a row, a page
-  over the Math Guide's length.
+  over the Math Guide's length. A default line (0.5pt, painted 1px) has its excess too — the
+  CSS fallback of `--border-over`, so an explicit bottom border always sets the variable — and
+  what the paddings cannot take (Word's cells have none above or below) a negative margin on
+  the cell's `::after` does: measured, a 20pt row is 20.5pt in both word processors, not 20.75.
+- **In a Word document the cell margin is measured from the grid line.** Word's PDF centres a
+  line in exactly cell width − left − right margin, the border taking nothing; LibreOffice
+  reserves one declared border width per cell, and Chromium's collapsed 1px line half a pixel
+  per side. `.paper[data-spacing-model='max']` takes that half pixel back off the side paddings,
+  which is what fits a cell line that fills its cell to within half a point (measured: 144pt of
+  text in a 144.5pt cell, one line in both word processors, two before).
+  **Here the geometry follows Word, not LibreOffice**, even though LibreOffice is the reference
+  elsewhere: its author laid the document out in Word, and LibreOffice reserves the border
+  even when it opens the DOCX. No file setting decides between the two, and switching on the
+  source format would re-lay a document saved as ODT and reopened. The cost is a cell line
+  filled to within the border width: it wraps in LibreOffice and not here (measured: one cell
+  in the corpus, 4 → 12 reports, against 40 → 17 and two pages for a Word-authored form).
 - **`<th>` carries no UA defaults.** A repeating ODF header row (`table:table-header-rows`)
   becomes a `tableHeader`, and the browser centres and bolds it — neither Word nor LibreOffice
   does. `editor.css` resets both, so the cell follows its own style (the "header row" preset's

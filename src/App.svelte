@@ -15,6 +15,8 @@
   import { loadRecentFiles, rememberRecentFile, readRecentFile, forgetRecentFile, forgetRecentFiles, pruneRecentFiles, type RecentFile } from './lib/storage/recentFiles';
   import { isProtected, decryptPackage, WRONG_PASSWORD } from './lib/crypto/protect';
   import { convertUnsupportedImages } from './lib/import/imageFormats';
+  import { repairContent, repairZones } from './lib/import/repairContent';
+  import en from './lib/i18n/locales/en';
   import { getPageBreakDebug } from './lib/editor/extensions/pageBreaks';
   import { RECORDING } from './lib/editor/extensions/trackChanges';
   import { getColumnsFlowDebug } from './lib/editor/extensions/columnsFlow';
@@ -46,10 +48,12 @@
   import { loadPageNumbering, savePageNumbering, DEFAULT_PAGE_NUMBERING, type PageNumbering } from './lib/storage/pageNumbering';
   import { loadPageDecor, savePageDecor, EMPTY_PAGE_DECOR, type PageDecor } from './lib/storage/pageDecor';
   import { loadLineNumbering, saveLineNumbering, DEFAULT_LINE_NUMBERING, type LineNumbering } from './lib/storage/lineNumbering';
+  import { loadBalanceSpaces, saveBalanceSpaces } from './lib/storage/balanceSpaces';
+  import { loadLineGrid, saveLineGrid, DEFAULT_LINE_GRID, type LineGrid } from './lib/storage/lineGrid';
   import { loadFoldMarks, saveFoldMarks } from './lib/storage/foldMarks';
   import { printMarkup } from './lib/storage/printMarkup.svelte';
   import { commentsInPane, changesInPane, markupAttrs, setShowChanges, setShowComments } from './lib/storage/markup.svelte';
-  import { loadDocumentLanguage, saveDocumentLanguage, odfFromLanguage, type DocumentLanguage } from './lib/storage/documentLanguage';
+  import { isAsianTag, loadDocumentLanguage, loadDocumentLanguageOther, pickDocumentLanguage, saveDocumentLanguage, saveDocumentLanguageOther, odfFromLanguage, tagForLanguage, westernCode, type DocumentLanguage } from './lib/storage/documentLanguage';
   import { setTableLanguage } from './lib/storage/tableOptions.svelte';
   import { spellController } from './lib/spell/controller';
   import { setGrammarLanguage } from './lib/spell/grammar.svelte';
@@ -60,6 +64,8 @@
   import TemplateGalleryDialog from './lib/components/TemplateGalleryDialog.svelte';
   import type { TemplateEntry } from './lib/templates/types';
   import DocPropertiesDialog from './lib/components/DocPropertiesDialog.svelte';
+  import BrowserDocumentsDialog from './lib/components/BrowserDocumentsDialog.svelte';
+  import ResumeCard from './lib/components/ResumeCard.svelte';
   import PasswordDialog from './lib/components/PasswordDialog.svelte';
   import CommentsPane from './lib/components/CommentsPane.svelte';
   import RevisionsPane from './lib/components/RevisionsPane.svelte';
@@ -85,6 +91,7 @@
   import { registerEmbeddedFonts, clearEmbeddedFonts, embeddedFonts } from './lib/fonts/embeddedFonts';
   import { saveEmbeddedFonts, loadEmbeddedFonts, clearEmbeddedFontStore } from './lib/storage/embeddedFontStore';
   import { noteEmbeddedFonts } from './lib/components/ribbon/fontList.svelte';
+  import { OPEN_COMMAND_SEARCH_EVENT } from './lib/components/ribbon/commands';
 
   // launchQueue is not in lib.dom yet; reach it through this shape.
   type WithLaunchQueue = Window & {
@@ -107,20 +114,26 @@
 
   // Header/footer content + live-edit state. While a zone is being edited, the
   // top toolbars target hfEditor instead of the body editor (activeEditor below).
-  let headerDoc: HfDoc = $state(loadHfDoc('header'));
-  let footerDoc: HfDoc = $state(loadHfDoc('footer'));
+  // Stored zones pass the zone schema's check, as an import does.
+  const storedZones = repairZones({
+    header: loadHfDoc('header'), footer: loadHfDoc('footer'),
+    headerFirst: loadHfDoc('header', 'first'), footerFirst: loadHfDoc('footer', 'first'),
+    headerEven: loadHfDoc('header', 'even'), footerEven: loadHfDoc('footer', 'even'),
+  });
+  let headerDoc: HfDoc = $state(storedZones.header);
+  let footerDoc: HfDoc = $state(storedZones.footer);
   // First-page header/footer, shown on page 1 when the flag is on.
-  let headerFirstDoc: HfDoc = $state(loadHfDoc('header', 'first'));
-  let footerFirstDoc: HfDoc = $state(loadHfDoc('footer', 'first'));
+  let headerFirstDoc: HfDoc = $state(storedZones.headerFirst);
+  let footerFirstDoc: HfDoc = $state(storedZones.footerFirst);
   let differentFirstPage: boolean = $state(loadDifferentFirstPage());
   // Even-page header/footer, shown on even pages when the flag is on.
-  let headerEvenDoc: HfDoc = $state(loadHfDoc('header', 'even'));
-  let footerEvenDoc: HfDoc = $state(loadHfDoc('footer', 'even'));
+  let headerEvenDoc: HfDoc = $state(storedZones.headerEven);
+  let footerEvenDoc: HfDoc = $state(storedZones.footerEven);
   let differentOddEven: boolean = $state(loadDifferentOddEven());
   let hfDistances: HfDistances = $state(loadHfDistances());
   // Sections past the first; the layer edits them in place, section 1 stays the
   // per-zone state above.
-  let extraHfSections: HfSet[] = $state(loadExtraHfSections());
+  let extraHfSections: HfSet[] = $state(loadExtraHfSections().map((z) => repairZones(z)));
   let hfEditor: Editor | null = $state(null);
   let hfActive: HfZone | null = $state(null);
   let hfTick: number = $state(0);
@@ -259,6 +272,10 @@
   // The document's spell-check language; round-trips through the .odt. The effect
   // below persists it and switches the shared spell controller (loads the dict).
   let documentLanguage: DocumentLanguage = $state(loadDocumentLanguage());
+  let documentLanguageOther: string | null = $state(loadDocumentLanguageOther());
+  function setDocumentLanguage(code: DocumentLanguage) {
+    ({ main: documentLanguage, other: documentLanguageOther } = pickDocumentLanguage(documentLanguage, documentLanguageOther, code));
+  }
 
   // The document name (without .odt). Source of truth for the save filename;
   // set on open, editable in the header, blank → heading-derived fallback.
@@ -268,10 +285,13 @@
   let documentFormat: DocumentFormat = $state(loadDocFormat());
   let docProps: DocProperties = $state(loadDocProperties());
   let docPropsOpen = $state(false);
+  let browserDocsOpen = $state(false);
   let hyphenate = $state(loadHyphenation());
   let pageNumbering: PageNumbering = $state(loadPageNumbering());
   let pageDecor: PageDecor = $state(loadPageDecor());
   let lineNumbering: LineNumbering = $state(loadLineNumbering());
+  let lineGrid: LineGrid = $state(loadLineGrid());
+  let balanceSpaces = $state(loadBalanceSpaces());
   let foldMarks = $state(loadFoldMarks());
   // The switch keeps the user's wish; only A4 portrait, the paper DIN 5008 describes,
   // actually draws and exports the marks. Import and templates set the flag too, so
@@ -368,15 +388,18 @@
     savePageNumbering(pageNumbering);
     savePageDecor(pageDecor);
     saveLineNumbering(lineNumbering);
+    saveLineGrid(lineGrid);
+    saveBalanceSpaces(balanceSpaces);
     saveFoldMarks(foldMarks);
   });
 
   $effect(() => {
     saveDocumentLanguage(documentLanguage);
-    void spellController.setLanguage(documentLanguage);
+    saveDocumentLanguageOther(documentLanguageOther);
+    void spellController.setLanguage(westernCode(documentLanguage, documentLanguageOther));
     // A table cell's number is read and written in the document's language.
     setTableLanguage(documentLanguage);
-    setGrammarLanguage(documentLanguage);
+    setGrammarLanguage(westernCode(documentLanguage, documentLanguageOther));
   });
 
   $effect(() => {
@@ -405,14 +428,10 @@
 
   $effect(() => {
     saveDifferentOddEven(differentOddEven);
-    hfActive = null;
   });
 
-  // Persist the flag and end any active header/footer edit when it flips (the live
-  // editor is bound to one variant for its lifetime).
   $effect(() => {
     saveDifferentFirstPage(differentFirstPage);
-    hfActive = null;
   });
 
   $effect(() => {
@@ -687,6 +706,8 @@
     pageNumbering = { ...DEFAULT_PAGE_NUMBERING };
     pageDecor = { ...EMPTY_PAGE_DECOR };
     lineNumbering = { ...DEFAULT_LINE_NUMBERING };
+    lineGrid = { ...DEFAULT_LINE_GRID };
+    balanceSpaces = false;
     foldMarks = false;
     // Recording belongs to the document, so a new one starts off, as it does in both.
     setRecordChanges(false);
@@ -742,13 +763,15 @@
 
   // Replace the document with a parsed .odt; adopt its geometry/header/footer and
   // track the source handle (null for the fallback file input) so Save overwrites it.
-  // Distinct explicit fontFamily values (textStyle marks) anywhere in a TipTap JSON tree.
+  // Distinct explicit font names (textStyle marks, either half of the pair) anywhere in a
+  // TipTap JSON tree.
   function collectFontFamilies(node: unknown, out: Set<string>): void {
     if (!node || typeof node !== 'object') return;
-    const n = node as { marks?: { type?: string; attrs?: { fontFamily?: unknown } }[]; content?: unknown[] };
+    const n = node as { marks?: { type?: string; attrs?: { fontFamily?: unknown; fontFamilyAsian?: unknown } }[]; content?: unknown[] };
     if (Array.isArray(n.marks)) {
       for (const m of n.marks) {
-        if (m?.type === 'textStyle' && typeof m.attrs?.fontFamily === 'string') out.add(m.attrs.fontFamily);
+        if (m?.type !== 'textStyle') continue;
+        for (const f of [m.attrs?.fontFamily, m.attrs?.fontFamilyAsian]) if (typeof f === 'string') out.add(f);
       }
     }
     if (Array.isArray(n.content)) for (const c of n.content) collectFontFamilies(c, out);
@@ -833,6 +856,15 @@
           isDocx = !isDocx;
         } catch { throw err; }
       }
+      const { content, error: bodyError } = repairContent(result.content, editor.schema);
+      const zoneErrors: string[] = [];
+      Object.assign(result, repairZones(result, zoneErrors));
+      result.hfSections = result.hfSections?.map((z) => repairZones(z, zoneErrors));
+      const structureError = bodyError ?? zoneErrors[0];
+      if (structureError) {
+        console.warn('[import] Repaired invalid structure:', structureError);
+        result.warnings.push(en.importWarn.structureRepaired);
+      }
 
       const hasContent = editor.state.doc.textContent.length > 0 || editor.state.doc.childCount > 1;
       if (hasContent && !confirm(t().dialogs.confirmReplace)) {
@@ -845,7 +877,7 @@
       void saveEmbeddedFonts(result.fonts);
       noteEmbeddedFonts(result.fonts.map((f) => f.family));
 
-      loadContent(result.content); // onUpdate fires → autosave
+      loadContent(content); // onUpdate fires → autosave
       documentEpoch++;
       resetHistory();
       // Adopt the opened file's name as the document name (drives the save filename).
@@ -863,12 +895,17 @@
       pageNumbering = result.pageNumbering;
       pageDecor = result.decor;
       lineNumbering = result.lineNumbering;
+      lineGrid = result.lineGrid;
+      balanceSpaces = result.balanceSpaces;
       foldMarks = result.foldMarks === true;
       // The file says whether it goes on recording; ours is not the setting that counts.
       setRecordChanges(result.recordChanges);
       // Adopt the document's spell-check language (the $effect switches the
       // controller + loads its dictionary). null = file declared none; keep ours.
-      if (result.language) documentLanguage = result.language;
+      if (result.language) {
+        documentLanguage = result.language;
+        documentLanguageOther = result.languageOther ?? null;
+      }
       // Adopt the document's named paragraph styles (built-ins + the file's own). Table
       // styles are not stored in the file (ODF has no banding), so the registry survives —
       // an imported table finds its style again by name.
@@ -999,8 +1036,12 @@
 
   // Both exporters take the same document-wide arguments, and every save path needs
   // one of them. The exporter module loads on first use.
+  function exportLanguage() {
+    const odf = odfFromLanguage(documentLanguage);
+    return odf && { ...odf, other: documentLanguageOther };
+  }
   function exportArgs() {
-    return [pageMargins, pageOrientation, hfOpts(), odfFromLanguage(documentLanguage), pageFormat, styleSheet(), tabIntervalCm, spacingModel, pageRtl, noteSettings(), docProps, hyphenate, pageNumbering, pageDecor, lineNumbering, recordChanges(), foldMarksOn, spacingAtPageStart, embeddedFonts()] as const;
+    return [pageMargins, pageOrientation, hfOpts(), exportLanguage(), pageFormat, styleSheet(), tabIntervalCm, spacingModel, pageRtl, noteSettings(), docProps, hyphenate, pageNumbering, pageDecor, lineNumbering, recordChanges(), foldMarksOn, spacingAtPageStart, embeddedFonts(), lineGrid, balanceSpaces] as const;
   }
 
   async function buildBytes(kind: DocumentFormat, json: TiptapNode): Promise<Uint8Array> {
@@ -1237,6 +1278,7 @@
       [DEFAULT_SHORTCUTS.zoomIn, () => setZoom(zoom + 10)],
       [DEFAULT_SHORTCUTS.zoomOut, () => setZoom(zoom - 10)],
       [DEFAULT_SHORTCUTS.zoomReset, () => setZoom(100)],
+      [DEFAULT_SHORTCUTS.commandSearch, () => window.dispatchEvent(new Event(OPEN_COMMAND_SEARCH_EVENT))],
     ];
 
     function onKeydown(e: KeyboardEvent) {
@@ -1331,7 +1373,8 @@
       bind:splitView
       bind:pageColumns
       {documentLanguage}
-      onLanguage={(code) => (documentLanguage = code)}
+      {documentLanguageOther}
+      onLanguage={setDocumentLanguage}
       {zoom}
       onZoom={setZoom}
       onDebugDump={import.meta.env.DEV ? handleDebugDump : undefined}
@@ -1372,6 +1415,7 @@
       onPrint={handlePrint}
       onAbout={() => (aboutOpen = true)}
       onDocProperties={() => (docPropsOpen = true)}
+      onBrowserDocuments={() => (browserDocsOpen = true)}
       onProtect={() => (passwordSetOpen = true)}
       hasPassword={docProtected}
       onAutoCorrect={() => (autoCorrectOpen = true)}
@@ -1486,6 +1530,9 @@
               <button class="theme-option" onclick={handlePrintPdf} role="menuitem">
                 <span>{t().app.vectorPdf}</span>
                 <span class="theme-option-hint">{t().app.vectorHint}</span>
+              </button>
+              <button class="theme-option" onclick={() => { exportMenuOpen = false; browserDocsOpen = true; }} role="menuitem">
+                <span>{t().browserDocs.title}</span>
               </button>
               <button class="theme-option" onclick={handleSaveTemplate} role="menuitem">
                 <span>{t().app.template}</span>
@@ -1669,6 +1716,7 @@
   />
   <div class="editor-row">
   <EditorComponent
+    onDocumentLost={resetDocumentState}
     {documentEpoch}
     {pageRtl}
     bind:editor
@@ -1695,6 +1743,8 @@
     {pageNumbering}
     {pageDecor}
     {lineNumbering}
+    {lineGrid}
+    {balanceSpaces}
     foldMarks={foldMarksOn}
     commentAuthor={docProps.author}
     bind:extraHfSections
@@ -1766,8 +1816,8 @@
     </div>
     <div class="sb-center">
       <!-- The body editor, not activeEditor: a header/footer zone has no paragraph language. -->
-      <LanguagePicker value={documentLanguage} onChange={(code) => (documentLanguage = code)} {editor} {tick} />
-      <GrammarToggle value={documentLanguage} {editor} {tick} />
+      <LanguagePicker value={documentLanguage} other={documentLanguageOther} onChange={setDocumentLanguage} {editor} {tick} />
+      <GrammarToggle value={documentLanguage} other={documentLanguageOther} {editor} {tick} />
     </div>
     <div class="sb-right">
     <div class="zoom-controls">
@@ -1793,6 +1843,8 @@
   <AutoCorrectDialog bind:open={autoCorrectOpen} />
   <AutoTextDialog bind:open={autoTextOpen} editor={activeEditor} />
   <ThesaurusDialog bind:open={thesaurusOpen} editor={activeEditor} />
+  <BrowserDocumentsDialog bind:open={browserDocsOpen} />
+  <ResumeCard show={tick >= 0 && !!editor && !isDocNonEmpty()} onShowAll={() => (browserDocsOpen = true)} />
   <DocPropertiesDialog bind:open={docPropsOpen} props={docProps} onApply={(p) => { docProps = p; saveDocProperties(p); }} />
   <PasswordDialog
     bind:open={passwordSetOpen}
@@ -1811,7 +1863,7 @@
   />
   <!-- One instance for every entry point (styles gallery, insert-table menu): the
        callers only say which family to land on. -->
-  <StyleManagerDialog bind:open={styleManagerOpen} family={styleManagerFamily} editor={activeEditor} />
+  <StyleManagerDialog bind:open={styleManagerOpen} family={styleManagerFamily} editor={activeEditor} asianDocument={isAsianTag(tagForLanguage(documentLanguage) ?? '')} />
   <NoteOptionsDialog bind:open={noteOptionsOpen} />
   <SaveFormatDialog bind:open={saveFormatOpen} onPick={handleSaveAs} />
 </main>
@@ -2378,12 +2430,14 @@
     height: 26px;
     display: flex;
     align-items: center;
+    gap: 0.85rem;
     padding: 0 1rem;
     background: var(--color-toolbar-bg);
     border-top: 1px solid var(--color-border);
     font-family: var(--font-sans);
     font-size: 0.75rem;
     color: var(--color-text);
+    white-space: nowrap;
     user-select: none;
     z-index: 50;
   }
@@ -2592,5 +2646,19 @@
 
   .zoom-pct:hover {
     background: var(--color-btn-hover);
+  }
+
+  /* A narrow window drops the slider, a very narrow one the −/+ buttons too; the
+     percentage stays as the reset button. */
+  @media (max-width: 720px) {
+    .zoom-slider {
+      display: none;
+    }
+  }
+
+  @media (max-width: 600px) {
+    .zoom-btn {
+      display: none;
+    }
   }
 </style>

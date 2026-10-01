@@ -4,6 +4,7 @@
   import RibbonButton from '../RibbonButton.svelte';
   import CaptionDialog from '../../CaptionDialog.svelte';
   import BibliographyDialog from '../../BibliographyDialog.svelte';
+  import IndexUpdateDialog from '../../IndexUpdateDialog.svelte';
   import type { IndexKind } from '../../../editor/extensions/tableOfContents';
   import { anchored, clickOutside, isMenuOpen, toggleMenu, closeMenu } from '../menu.svelte';
   import type { HfZone } from '../../../storage/headerFooter';
@@ -30,10 +31,17 @@
     });
     return found;
   });
+  let hasIndex = $derived.by(() => {
+    if (tick < 0 || !editor) return false;
+    let found = false;
+    editor.state.doc.descendants((node) => { if (node.type.name === 'tableOfContents') found = true; return !found; });
+    return found;
+  });
   const LEVELS = HEADING_LEVELS;
   const INDEX_KINDS: IndexKind[] = ['toc', 'figures', 'tables', 'alphabetical', 'bibliography'];
   let captionOpen = $state(false);
   let citationOpen = $state(false);
+  let updateOpen = $state(false);
   let hasSelection = $derived(tick >= 0 && !!editor && !editor.state.selection.empty);
 
   // The selected text is the term unless the reader gives another — the same prompt
@@ -84,6 +92,7 @@
     <RibbonButton
       variant="big"
       icon="toc"
+      cmd="toc"
       label={t().ribbon.toc}
       title={hfActive ? t().toolbarExpanded.tocNotInHf : t().toolbarExpanded.insertToc}
       disabled={!editor || !!hfActive}
@@ -94,7 +103,7 @@
     {#if isMenuOpen('indexKind')}
       <div class="ribbon-menu" use:anchored role="menu">
         {#each INDEX_KINDS as k}
-          <button onclick={() => { closeMenu(); editor?.chain().focus().setTableOfContents(k).run(); }}>
+          <button data-cmd={`toc-${k}`} onclick={() => { closeMenu(); editor?.chain().focus().setTableOfContents(k).run(); }}>
             {t().ribbon.indexes[k]}
           </button>
         {/each}
@@ -105,6 +114,7 @@
     <RibbonButton
       variant="big"
       icon="tocLevels"
+      cmd="tocOptions"
       label={t().ribbon.tocOptions}
       title={`${t().ribbon.indexes.toc} – ${t().ribbon.tocOptions}`}
       disabled={!toc}
@@ -129,6 +139,17 @@
       </div>
     {/if}
   </div>
+  <!-- An index shows what it last listed, as in both word processors, until this: the
+       dialog offers Word's two choices, the whole index or its page numbers alone. -->
+  <RibbonButton
+    variant="big"
+    icon="update"
+    cmd="tocUpdate"
+    label={t().ribbon.tocUpdate}
+    title={t().ribbon.tocUpdateTitle}
+    disabled={!hasIndex}
+    onclick={() => (updateOpen = true)}
+  />
 </RibbonGroup>
 
 <div class="ribbon-sep"></div>
@@ -139,6 +160,7 @@
   <RibbonButton
     variant="big"
     icon="footnote"
+    cmd="footnote"
     label={t().toolbarExpanded.insertFootnote}
     title={hfActive ? t().toolbarExpanded.noteNotInHf : `${t().toolbarExpanded.insertFootnote} (${shortcutHint('footnote')})`}
     disabled={!editor || !!hfActive}
@@ -147,6 +169,7 @@
   <RibbonButton
     variant="big"
     icon="endnote"
+    cmd="endnote"
     label={t().toolbarExpanded.insertEndnote}
     title={hfActive ? t().toolbarExpanded.noteNotInHf : `${t().toolbarExpanded.insertEndnote} (${shortcutHint('endnote')})`}
     disabled={!editor || !!hfActive}
@@ -155,6 +178,7 @@
   <RibbonButton
     variant="big"
     icon="settings"
+    cmd="noteOptions"
     label={t().ribbon.noteOptions}
     title={t().notesDialog.title}
     disabled={!onNoteOptions}
@@ -168,6 +192,7 @@
   <RibbonButton
     variant="big"
     icon="citation"
+    cmd="citation"
     label={t().ribbon.citation}
     title={t().bibliography.title}
     disabled={!editor || !!hfActive}
@@ -177,6 +202,7 @@
     <RibbonButton
       variant="small"
       icon="citation"
+      cmd="citationStyle"
       label={t().bibliography.style}
       title={bibliography ? t().bibliography.style : t().bibliography.styleNeedsIndex}
       caret
@@ -202,6 +228,7 @@
   <RibbonButton
     variant="big"
     icon="caption"
+    cmd="caption"
     label={t().ribbon.insertCaption}
     title={t().caption.title}
     disabled={!editor || !!hfActive}
@@ -215,6 +242,7 @@
   <RibbonButton
     variant="big"
     icon="bookmark"
+    cmd="indexEntry"
     label={t().ribbon.indexEntry}
     title={hasSelection ? t().ribbon.indexEntry : t().ribbon.indexEntryNeedsSelection}
     disabled={!editor || !!hfActive || !hasSelection}
@@ -224,6 +252,7 @@
 
 <CaptionDialog bind:open={captionOpen} {editor} />
 <BibliographyDialog bind:open={citationOpen} {editor} />
+<IndexUpdateDialog bind:open={updateOpen} onPick={(mode) => editor?.chain().focus().updateIndexes(mode).run()} />
 
 <style>
   .rb-menu-wrap { position: relative; }

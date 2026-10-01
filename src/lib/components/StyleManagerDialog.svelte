@@ -1,7 +1,7 @@
 <script lang="ts">
   import { untrack } from 'svelte';
   import type { Editor } from '@tiptap/core';
-  import { t } from '../i18n/i18n.svelte';
+  import { styleLabel, t } from '../i18n/i18n.svelte';
   import {
     DEFAULT_STYLE, HEADING_PARENT, isAbstractStyle, propsFromBlock, resolveStyle, styleDelta,
     styleOrder, uniqueStyleName, type Style, type StyleFamily,
@@ -23,13 +23,14 @@
   import { activeCharacterStyle } from '../editor/extensions/characterStyle';
   import { activeTableStyle } from '../editor/extensions/tableStyle';
   import { CANDIDATE_FONTS, detectAvailableFonts } from '../utils/fontDetect';
+  import { fontLabel, isAsianFont } from './ribbon/fontList.svelte';
   import AlignIcon, { type AlignValue } from './AlignIcon.svelte';
   import ColorPicker from './ColorPicker.svelte';
 
   // LibreOffice's style manager: pick a style, edit its properties, or make a new one
   // from the cursor's formatting. Edits apply live — every block using the style follows.
-  let { open = $bindable(false), editor, family: openFamily = 'paragraph' }:
-    { open?: boolean; editor: Editor | null; family?: StyleFamily } = $props();
+  let { open = $bindable(false), editor, family: openFamily = 'paragraph', asianDocument = false }:
+    { open?: boolean; editor: Editor | null; family?: StyleFamily; asianDocument?: boolean } = $props();
 
   const ALIGNMENTS: AlignValue[] = ['left', 'center', 'right', 'justify'];
   // Beyond this the indent would push the name out of the 14rem pane, so deeper
@@ -241,6 +242,11 @@
       ? [ownText.fontFamily, ...fonts]
       : fonts,
   );
+  let asianFontOptions = $derived.by(() => {
+    const asian = fonts.filter(isAsianFont);
+    const own = ownText.fontFamilyAsian;
+    return own && !asian.includes(own) ? [own, ...asian] : asian;
+  });
 
   // A field left empty clears the style's own value, so it inherits again.
   const num = (v: string) => (v.trim() === '' ? undefined : Number(v));
@@ -281,6 +287,7 @@
     if (text.underline) chain.unsetUnderline();
     if (text.strike) chain.unsetStrike();
     if (text.fontFamily) chain.unsetFontFamily();
+    if (text.fontFamilyAsian) chain.unsetFontFamilyAsian();
     if (text.fontSizePt != null) chain.unsetFontSize();
     if (text.color) chain.unsetColor();
     chain.removeEmptyTextStyle().setCharacterStyle(name).run();
@@ -447,11 +454,11 @@
                   class="entry"
                   class:active={current === s.name}
                   style="padding-left: {indentRem(0)}rem"
-                  title={s.name}
+                  title={styleLabel(s.name)}
                   onclick={() => select(s.name)}
                   ondblclick={() => { if (!s.builtin) editingName = s.name; }}
                 >
-                  <span class="name">{s.name}</span>
+                  <span class="name">{styleLabel(s.name)}</span>
                   {#if !s.builtin}<span class="badge">{t().styles.custom}</span>{/if}
                 </button>
               {/if}
@@ -478,11 +485,11 @@
                   class="entry"
                   class:active={current === s.name}
                   style="padding-left: {indentRem(0)}rem"
-                  title={s.name}
+                  title={styleLabel(s.name)}
                   onclick={() => select(s.name)}
                   ondblclick={() => { if (!s.builtin) editingName = s.name; }}
                 >
-                  <span class="name">{s.name}</span>
+                  <span class="name">{styleLabel(s.name)}</span>
                   {#if !s.builtin}<span class="badge">{t().styles.custom}</span>{/if}
                 </button>
               {/if}
@@ -509,11 +516,11 @@
                 class="entry"
                 class:active={current === s.name}
                 style="padding-left: {indentRem(depth)}rem"
-                title={s.name}
+                title={styleLabel(s.name)}
                 onclick={() => select(s.name)}
                 ondblclick={() => { if (!s.builtin) editingName = s.name; }}
               >
-                <span class="name">{s.name}</span>
+                <span class="name">{styleLabel(s.name)}</span>
                 {#if isAbstractStyle(s.name)}<span class="badge">{t().styles.abstract}</span>
                 {:else if !s.builtin}<span class="badge">{t().styles.custom}</span>{/if}
               </button>
@@ -674,12 +681,12 @@
           color: {resolved.text.color ?? 'var(--color-page-text)'};
           text-decoration: {[resolved.text.underline && 'underline', resolved.text.strike && 'line-through'].filter(Boolean).join(' ') || 'none'};
           text-align: {resolved.para.textAlign ?? 'left'};
-        ">{style.name}</div>
+        ">{styleLabel(style.name)}</div>
 
         <label>{t().styles.parent}
           <select value={style.parent ?? ''} onchange={(e) => putStyle({ ...style, parent: e.currentTarget.value || null }, family)}>
             <option value="">—</option>
-            {#each parentOptions as name}<option value={name}>{name}</option>{/each}
+            {#each parentOptions as name}<option value={name}>{styleLabel(name)}</option>{/each}
           </select>
         </label>
         {/if}
@@ -695,6 +702,21 @@
             {/each}
           </select>
         </label>
+
+        <!-- The pair's asian half, where the document is East Asian or the style has one. -->
+        {#if asianDocument || resolvedText.fontFamilyAsian}
+          <label>{t().styles.fontAsian}
+            <select
+              value={ownText.fontFamilyAsian ?? ''}
+              onchange={(e) => editText({ fontFamilyAsian: e.currentTarget.value || undefined })}
+            >
+              <option value="">{inherited(resolvedText.fontFamilyAsian) || '—'}</option>
+              {#each asianFontOptions as font}
+                <option value={font} style="font-family: '{font}'">{fontLabel(font)}</option>
+              {/each}
+            </select>
+          </label>
+        {/if}
 
         <div class="row">
           <label>{t().styles.size}

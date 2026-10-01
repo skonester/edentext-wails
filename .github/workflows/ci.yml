@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   check-and-test:
@@ -77,3 +78,36 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxml2-utils
       - run: npm run test:monkey
+
+  # Publishes dist/ to GitHub Pages only once every leg above is green, so a red
+  # push keeps the last good version live. Pages source must be "GitHub Actions".
+  deploy:
+    needs: [check-and-test, lo-roundtrip, browser]
+    # A fork has no Pages site until one is set up, so only the original repository deploys.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && !github.event.repository.fork
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    # One deploy at a time; a newer push supersedes a running one.
+    concurrency:
+      group: pages
+      cancel-in-progress: true
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -35,7 +35,8 @@ again. The final ODT writes `mimetype` first and stored, preserves already-compr
 and deflates remaining entries once.
 
 Sentinels carry editor features that `odf-kit` cannot express through every serializer path.
-Replacement passes restore inline breaks and tabs, images, custom paragraph attributes, named
+Replacement passes restore inline breaks, tabs and collapsible spaces (every space opening a
+paragraph or following another, counted across runs — LibreOffice reads raw `a  b` as `a b`), images, custom paragraph attributes, named
 styles, page and section breaks, text boxes, fields, revisions, notes, and other format-specific
 nodes. Keep the source definitions and replacement order in `odt.ts` authoritative; do not add
 a second serialized representation of the same feature.
@@ -57,6 +58,14 @@ Named paragraph, character, and list styles are emitted into the right ODF style
 Automatic styles inherit from their named parent when direct formatting remains. Pair vertical
 margins when a direct override changes either side: LibreOffice otherwise resolves the omitted
 side from the default style instead of the parent chain.
+
+Header/footer zones ride the body path: `buildOdt` appends each zone's blocks behind the body
+between `HFZ` marker paragraphs, so every content pass covers them, and `cutZones` moves each
+region into its master page, copying the automatic styles it reaches into styles.xml under
+`Hz*` names (a zone may sit in several masters, so its `xml:id`s go). DOCX writes a zone through
+`blocksToDocx`; its sentinel passes run over header and footer parts with their own
+relationships, and a zone's list instances are registered before packing, since the package
+writes numbering.xml ahead of its header parts.
 
 ODF sections write their own page layout and master-page variants. Header/footer distances are
 part of page geometry, not body margins. Each master writes an explicit zone, including blank
@@ -88,15 +97,33 @@ chain already supplies them. Rasterize vector images that Word cannot display be
 ### Language by script
 
 Both formats keep three languages side by side — western, asian, complex — and both word
-processors read Chinese, Japanese and Korean text from the **asian** one alone. An East Asian
-tag is therefore written there (`w:lang w:eastAsia`, `style:language-asian`) and nowhere else,
-which is also what makes the document's Han default font (`w:rFonts w:eastAsia`,
-`style:font-name-asian`) the one that applies. The importers read the **western** slot first and
-the asian one only where there is none: LibreOffice and Word give every document an asian
-default (`zh-CN`) whatever it is written in, so that slot alone proves nothing — but a file
-naming only it, as ours does, means it. The consequence is known: a Chinese document re-saved
-by LibreOffice comes back carrying its western default, and the editor reads that. Holding both
-languages at once is the same work as the western/asian font pair per run, and waits for it.
+processors read Chinese, Japanese and Korean text from the **asian** one alone. A run, a
+paragraph and the document therefore carry a western and an asian language (`lang`,
+`langAsian`), each tag written to the slot of its script (`fo:language`/`w:val`,
+`style:language-asian`/`w:eastAsia`), which is also what makes the document's Han default font
+(`w:rFonts w:eastAsia`, `style:font-name-asian`) the one that applies. The document keeps a main
+language (spell check, dates, number formats) and the other slot's tag (`documentLanguageOther`);
+the spell check reads the western one, so a Chinese document checks its Latin words. Both word
+processors write an asian default (`zh-CN`) into every file whatever it is written in, so on
+import that slot leads only where the body has more East Asian characters than Latin letters
+(`mainOfPair`); a Chinese document re-saved by LibreOffice, which adds its own western default,
+still reads as Chinese. LibreOffice lifts a run language spanning its paragraph onto the
+paragraph.
+
+### Font pair
+
+A run, a paragraph mark and a style carry a western font and an asian one (`fontFamily`,
+`fontFamilyAsian`), each written to its own slot: `style:font-name` (+ `-complex`) and
+`style:font-name-asian`, `w:ascii`/`w:hAnsi`/`w:cs` and `w:eastAsia`. A half the model leaves
+unset is not written, so it inherits, as it does on screen. odf-kit copies a run's one font into
+all three slots, so `dropKitAsianFonts` removes the copy from its automatic styles before any
+other pass, `odfExtraTextProps` adds a run's own asian font, and `declareReferencedFonts` gives
+every name a `<style:font-face>`. The Standard style's asian slot is the Han default in an East
+Asian document and the western default otherwise.
+
+The Han default font follows the country: SimSun, PMingLiU for Taiwan, Hong Kong and Macau, and
+Yu Mincho for Japan — the first face in LibreOffice's Japanese `CJK_TEXT` list (`VCL.xcu`) that
+ships with both Windows and macOS, and the default of current Japanese Office.
 
 ## Feature boundaries
 

@@ -16,6 +16,8 @@
   import { formatOrdinal } from '../../../utils/orderedListTypes';
   import { t } from '../../../i18n/i18n.svelte';
   import { shortcutHint } from '../../../editor/shortcuts';
+  import { leftCm, rightCm } from '../../../editor/extensions/indent';
+  import { blockFontSize } from '../../../utils/fontSize';
 
   let {
     editor, tick, hfActive = null,
@@ -132,8 +134,19 @@
   }
 
   // --- Paragraph indent and spacing, in the units Word's Layout tab uses ---
-  let indentLeft = $derived(tick >= 0 && editor ? uniformBlockAttr<number>(editor.state, 'indent', 0) : 0);
-  let indentRight = $derived(tick >= 0 && editor ? uniformBlockAttr<number>(editor.state, 'indentRight', 0) : 0);
+  // An indent counted in characters shows here in cm, at the cursor block's size.
+  let indentLeft = $derived.by(() => {
+    if (tick < 0 || !editor) return 0;
+    if (!uniformBlockAttr<number>(editor.state, 'indentChars', 0)) return uniformBlockAttr<number>(editor.state, 'indent', 0);
+    const block = editor.state.selection.$from.parent;
+    return leftCm(block.attrs, parseFloat(blockFontSize(block)));
+  });
+  let indentRight = $derived.by(() => {
+    if (tick < 0 || !editor) return 0;
+    if (!uniformBlockAttr<number>(editor.state, 'indentRightChars', 0)) return uniformBlockAttr<number>(editor.state, 'indentRight', 0);
+    const block = editor.state.selection.$from.parent;
+    return rightCm(block.attrs, parseFloat(blockFontSize(block)));
+  });
   let spaceBefore = $derived(tick >= 0 && editor ? uniformBlockAttr<number>(editor.state, 'spaceBefore', 0) : 0);
   let spaceAfter = $derived(tick >= 0 && editor ? uniformBlockAttr<number>(editor.state, 'spaceAfter', 0) : 0);
 
@@ -147,11 +160,11 @@
 
 <RibbonGroup label={t().ribbon.groups.pageSetup}>
   <div class="rb-menu-wrap" use:clickOutside={'margins'}>
-    <RibbonButton variant="big" icon="margins" label={t().ribbon.margins} title={t().toolbarExpanded.pageMargins} caret active={isMenuOpen('margins')} onclick={() => toggleMenu('margins')} />
+    <RibbonButton variant="big" icon="margins" cmd="margins" label={t().ribbon.margins} title={t().toolbarExpanded.pageMargins} caret active={isMenuOpen('margins')} onclick={() => toggleMenu('margins')} />
     {#if isMenuOpen('margins')}
       <div class="ribbon-menu margin-menu" use:anchored role="menu">
         {#each MARGIN_PRESETS as p}
-          <button onclick={() => { closeMenu(); pageMargins = withMirrored(p.m, pageMargins.mirrored === true); }}>
+          <button data-cmd={`margins-${p.key}`} onclick={() => { closeMenu(); pageMargins = withMirrored(p.m, pageMargins.mirrored === true); }}>
             {t().ribbon.marginPresets[p.key]}
             <span class="menu-sub">{fmtCm(p.m.top)} / {fmtCm(p.m.left)} cm</span>
           </button>
@@ -185,11 +198,11 @@
   </div>
 
   <div class="rb-menu-wrap" use:clickOutside={'orientation'}>
-    <RibbonButton variant="big" icon="orientation" label={t().toolbarExpanded.orientation} title={t().toolbarExpanded.orientation} caret active={isMenuOpen('orientation')} onclick={() => toggleMenu('orientation')} />
+    <RibbonButton variant="big" icon="orientation" cmd="orientation" label={t().toolbarExpanded.orientation} title={t().toolbarExpanded.orientation} caret active={isMenuOpen('orientation')} onclick={() => toggleMenu('orientation')} />
     {#if isMenuOpen('orientation')}
       <div class="ribbon-menu" use:anchored role="menu">
         {#each (['portrait', 'landscape'] as const) as o}
-          <button class:selected={pageOrientation === o} onclick={() => { closeMenu(); pageOrientation = o; }}>{t().toolbarExpanded[o]}</button>
+          <button data-cmd={`orientation-${o}`} class:selected={pageOrientation === o} onclick={() => { closeMenu(); pageOrientation = o; }}>{t().toolbarExpanded[o]}</button>
         {/each}
         {#if currentSection > 0}
           <div class="rb-menu-label">{t().ribbon.thisSection}</div>
@@ -203,12 +216,12 @@
   </div>
 
   <div class="rb-menu-wrap" use:clickOutside={'pageFormat'}>
-    <RibbonButton variant="big" icon="pageSize" label={t().ribbon.size} title={t().toolbarExpanded.pageFormat} caret active={isMenuOpen('pageFormat')} onclick={() => toggleMenu('pageFormat')} />
+    <RibbonButton variant="big" icon="pageSize" cmd="pageSize" label={t().ribbon.size} title={t().toolbarExpanded.pageFormat} caret active={isMenuOpen('pageFormat')} onclick={() => toggleMenu('pageFormat')} />
     {#if isMenuOpen('pageFormat')}
       <div class="ribbon-menu format-menu" use:anchored role="menu">
         <div class="menu-scroll">
           {#each FORMATS as f}
-            <button class:selected={pageFormat === f} onclick={() => { closeMenu(); pageFormat = f; }}>
+            <button data-cmd={`pageSize-${f}`} class:selected={pageFormat === f} onclick={() => { closeMenu(); pageFormat = f; }}>
               {t().toolbarExpanded.pageFormats[f]}
               <span class="menu-sub">{fmtCm(PAGE_FORMAT_CM[f].w)} × {fmtCm(PAGE_FORMAT_CM[f].h)} cm</span>
             </button>
@@ -231,6 +244,7 @@
     <RibbonButton
       variant="big"
       icon="columns"
+      cmd="columns"
       label={t().toolbarExpanded.columns}
       title={hfActive ? t().toolbarExpanded.columnsNotInHf : t().toolbarExpanded.columns}
       disabled={!editor || !!hfActive}
@@ -241,7 +255,7 @@
     {#if isMenuOpen('columns')}
       <div class="ribbon-menu" use:anchored role="menu">
         {#each [1, 2, 3] as n}
-          <button class:selected={colState.count === n} onclick={() => setColumns(n)}>
+          <button data-cmd={`columns-${n}`} class:selected={colState.count === n} onclick={() => setColumns(n)}>
             {@render colPreview(n)}
             {n === 1 ? t().toolbarExpanded.columnsOne : n === 2 ? t().toolbarExpanded.columnsTwo : t().toolbarExpanded.columnsThree}
           </button>
@@ -265,6 +279,7 @@
     <RibbonButton
       variant="big"
       icon="pageBreak"
+      cmd="breaks"
       label={t().ribbon.breaks}
       title={t().ribbon.breaks}
       disabled={!editor || !!hfActive}
@@ -278,7 +293,7 @@
           {t().ribbon.pageBreak}
           <span class="menu-key">{shortcutHint('pageBreak')}</span>
         </button>
-        <button onclick={() => { closeMenu(); editor?.chain().focus().updateAttributes('paragraph', { sectionBreak: true }).run(); }}>
+        <button data-cmd="sectionBreak" onclick={() => { closeMenu(); editor?.chain().focus().updateAttributes('paragraph', { sectionBreak: true }).run(); }}>
           {t().ribbon.sectionBreak}
           <span class="menu-sub">{t().ribbon.sectionBreakHint}</span>
         </button>
@@ -304,6 +319,7 @@
     <RibbonButton
       variant="small"
       icon="hyphenation"
+      cmd="hyphenation"
       label={t().ribbon.hyphenation}
       title={t().ribbon.hyphenationHint}
       active={hyphenate}
@@ -313,6 +329,7 @@
       <RibbonButton
         variant="small"
         icon="pageNumber"
+        cmd="pageNumberFormat"
         label={t().ribbon.pageNumberFormat}
         title={t().ribbon.pageNumberFormat}
         caret
@@ -375,6 +392,7 @@
       <RibbonButton
         variant="small"
         icon="lineNumbers"
+        cmd="lineNumbers"
         label={t().ribbon.lineNumbers}
         title={t().lineNumbers.title}
         caret
@@ -410,6 +428,7 @@
     <RibbonButton
       variant="small"
       icon="watermark"
+      cmd="pageDecor"
       label={t().ribbon.pageDecor}
       title={t().pageDecor.title}
       active={!!(pageDecor.background || pageDecor.border || pageDecor.watermark)}
@@ -418,6 +437,7 @@
     <RibbonButton
       variant="small"
       icon="foldMarks"
+      cmd="foldMarks"
       label={t().ribbon.foldMarks}
       title={foldMarksFit ? t().ribbon.foldMarksHint : t().ribbon.foldMarksA4Hint}
       active={foldMarks && foldMarksFit}
@@ -435,22 +455,22 @@
      value be typed. -->
 <RibbonGroup label={t().ribbon.groups.paragraph} onLauncher={onParagraphDialog} launcherTitle={t().paragraphDialog.title}>
   <div class="field-grid">
-    <label class="field">
+    <label class="field" data-cmd="indentLeft">
       <span>{t().ribbon.indentLeft}</span>
       <input type="text" inputmode="decimal" value={num(indentLeft)} disabled={!editor}
         onchange={(e) => apply((v) => editor?.chain().focus().setIndent(v).run(), (e.currentTarget as HTMLInputElement).value)} />
     </label>
-    <label class="field">
+    <label class="field" data-cmd="spaceBefore">
       <span>{t().ribbon.spaceBefore}</span>
       <input type="text" inputmode="decimal" value={num(spaceBefore)} disabled={!editor}
         onchange={(e) => apply((v) => editor?.chain().focus().setSpaceBefore(v).run(), (e.currentTarget as HTMLInputElement).value)} />
     </label>
-    <label class="field">
+    <label class="field" data-cmd="indentRight">
       <span>{t().ribbon.indentRight}</span>
       <input type="text" inputmode="decimal" value={num(indentRight)} disabled={!editor}
         onchange={(e) => apply((v) => editor?.chain().focus().setIndentRight(v).run(), (e.currentTarget as HTMLInputElement).value)} />
     </label>
-    <label class="field">
+    <label class="field" data-cmd="spaceAfter">
       <span>{t().ribbon.spaceAfter}</span>
       <input type="text" inputmode="decimal" value={num(spaceAfter)} disabled={!editor}
         onchange={(e) => apply((v) => editor?.chain().focus().setSpaceAfter(v).run(), (e.currentTarget as HTMLInputElement).value)} />

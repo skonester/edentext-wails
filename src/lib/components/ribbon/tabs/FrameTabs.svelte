@@ -56,7 +56,7 @@
 
 <RibbonGroup label={t().ribbon.groups.arrange}>
   {#each WRAPS as w}
-    <RibbonButton variant="big" icon={w.icon} label={w.label()} title={w.label()} active={active === w.key} onclick={() => setWrap(w.key)} />
+    <RibbonButton variant="big" icon={w.icon} cmd={`wrap-${w.key}`} label={w.label()} title={w.label()} active={active === w.key} onclick={() => setWrap(w.key)} />
   {/each}
 </RibbonGroup>
 
@@ -81,7 +81,7 @@
   <!-- The alt text has always ridden along in both formats, filled in from the
        file name and never editable. -->
   <RibbonGroup label={t().ribbon.groups.accessibility}>
-    <label class="field alt">
+    <label class="field alt" data-cmd="altText">
       <span>{t().ribbon.altText}</span>
       <input
         type="text"
@@ -97,14 +97,14 @@
   <div class="ribbon-sep"></div>
 
   <RibbonGroup label={t().ribbon.groups.shapeStyles}>
-    <div class="rb-captioned" use:captionClicks>
+    <div class="rb-captioned" data-cmd="shape" use:captionClicks>
       <ShapePicker
         value={shapeKind ?? 'textbox'}
         onPick={(k) => editor?.chain().focus().setTextBoxAttrs({ shapeKind: k }).run()}
       />
       <span class="rb-caption">{t().textBox.shape}</span>
     </div>
-    <div class="rb-captioned" use:captionClicks>
+    <div class="rb-captioned" data-cmd="fillColor" use:captionClicks>
       <ColorPicker
         {editor}
         currentColor={fillColor ?? null}
@@ -118,7 +118,7 @@
       />
       <span class="rb-caption">{t().textBox.fillColor}</span>
     </div>
-    <div class="rb-captioned" use:captionClicks>
+    <div class="rb-captioned" data-cmd="borderColor" use:captionClicks>
       <ColorPicker
         {editor}
         currentColor={strokeColor ?? null}
@@ -132,7 +132,7 @@
       />
       <span class="rb-caption">{t().textBox.borderColor}</span>
     </div>
-    <label class="field">
+    <label class="field" data-cmd="borderWidth">
       <span>{t().textBox.borderWidth}</span>
       <input
         type="text"
@@ -152,6 +152,7 @@
     <RibbonButton
       variant="big"
       icon="textDirection"
+      cmd="verticalText"
       label={t().textBox.verticalText}
       title={t().textBox.verticalText}
       active={textVertical}
@@ -159,6 +160,7 @@
     />
     {#each VALIGNS as v}
       <RibbonButton
+        cmd={`textAlign-${v.icon.slice(5)}`}
         icon={v.icon}
         title={v.label()}
         active={textVAlign === v.key}

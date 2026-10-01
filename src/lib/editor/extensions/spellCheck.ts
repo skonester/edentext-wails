@@ -1,11 +1,12 @@
 import { Extension } from '@tiptap/core';
 import { Plugin, PluginKey } from '@tiptap/pm/state';
-import { Decoration, DecorationSet } from '@tiptap/pm/view';
+import { Decoration, DecorationSet, type EditorView } from '@tiptap/pm/view';
 import type { EditorState, Transaction } from '@tiptap/pm/state';
 import type { Node as PmNode } from '@tiptap/pm/model';
 import { spellController } from '../../spell/controller';
-import { codeForTag, type DocumentLanguage } from '../../storage/documentLanguage';
+import { codeForTag, westLang, type DocumentLanguage } from '../../storage/documentLanguage';
 import { isPaginating } from './pageBreaks';
+import { ASIAN_SCRIPT_RE } from '../../utils/script';
 
 export type Range = { from: number; to: number };
 // dirty: what the edits since the last check touched, in the current document's positions.
@@ -26,9 +27,11 @@ const DEBOUNCE_MS = 400;
 const WORD_RE = /[\p{L}\p{M}]+(?:['’\-][\p{L}\p{M}]+)*/gu;
 
 // The dictionary a node is checked against: its run's language, else its block's, else
-// the document's (language.ts carries both as full tags).
+// the document's (language.ts carries both as full tags). Only the western language
+// counts: a dictionary checks the text outside East Asian script.
 function codeOf(tag: unknown): DocumentLanguage | undefined {
-  return typeof tag === 'string' && tag ? codeForTag(tag) ?? undefined : undefined;
+  const west = westLang(tag);
+  return west ? codeForTag(west) ?? undefined : undefined;
 }
 
 function langOf(node: PmNode, blockLang: DocumentLanguage | undefined): DocumentLanguage | undefined {
@@ -50,7 +53,8 @@ function wordDecos(node: PmNode, base: number, decos: Decoration[], blockLang?: 
     let m: RegExpExecArray | null;
     while ((m = WORD_RE.exec(text)) !== null) {
       const word = m[0];
-      if (word.length < 2 || spellController.check(word, code)) continue;
+      // East Asian script is in the asian language, which no dictionary here checks.
+      if (word.length < 2 || ASIAN_SCRIPT_RE.test(word) || spellController.check(word, code)) continue;
       const from = base + pos + m.index;
       decos.push(Decoration.inline(from, from + word.length, { class: 'pm-spell-error' }));
     }
@@ -100,6 +104,98 @@ export function changedRanges(tr: Transaction): Range[] {
     map.forEach((_oldFrom, _oldTo, from, to) => out.push({ from: rest.map(from, -1), to: rest.map(to, 1) }));
   });
   return out;
+}
+
+// Squiggles are painted as CSS highlights, not inline decorations: Chromium's hyphenating
+// line breaker pulls back one word too many where a word ends an element and its space
+// sits outside it, and a decoration span around every flagged word is exactly that.
+export const HIGHLIGHTS = typeof CSS !== 'undefined' && 'highlights' in CSS;
+
+// Paints `setOf`'s ranges into the highlight `name` (styled as ::highlight(name)) once a
+// frame after any view update. A textblock whose node, squiggle offsets and DOM are all
+// unchanged keeps its ranges: domAtPos walks from the root and costs ~15 ms per 1000 squiggles.
+// Only top-level blocks from a screen above to two below the viewport are painted, repainted
+// on scroll: Chromium re-reads every range of a highlight on a change (~50 ms a key at 60 000).
+export function paintHighlight(view: EditorView, name: string, setOf: (state: EditorState) => DecorationSet | undefined) {
+  if (!HIGHLIGHTS) return { update() {}, destroy() {} };
+  const highlight = CSS.highlights.get(name) ?? new Highlight();
+  CSS.highlights.set(name, highlight);
+  type Block = { offsets: number[]; ranges: StaticRange[] };
+  let blocks = new Map<PmNode, Block>();
+  // A node twice in the document (shared on paste) is painted afresh each time, never cached.
+  let loose: StaticRange[] = [];
+  let frame = 0;
+  const drop = () => {
+    for (const r of loose) highlight.delete(r);
+    for (const b of blocks.values()) for (const r of b.ranges) highlight.delete(r);
+  };
+  // The document span of the top-level blocks near the viewport, found by bisecting their rects.
+  const nearView = (doc: PmNode): [number, number] => {
+    const starts: number[] = [];
+    doc.forEach((_, offset) => starts.push(offset));
+    const h = window.innerHeight;
+    const rect = (i: number) => (view.nodeDOM(starts[i]) as Element | null)?.getBoundingClientRect?.();
+    const bisect = (lo: number, before: (r: DOMRect) => boolean) => {
+      for (let hi = starts.length; lo < hi;) {
+        const mid = (lo + hi) >> 1, r = rect(mid);
+        if (!r) return -1;
+        if (before(r)) lo = mid + 1; else hi = mid;
+      }
+      return lo;
+    };
+    const first = bisect(0, (r) => r.bottom < -h);
+    const last = first < 0 ? -1 : bisect(first, (r) => r.top <= 2 * h);
+    if (last < 0) return [0, doc.content.size];
+    return [starts[first] ?? doc.content.size, starts[last] ?? doc.content.size];
+  };
+  const paint = () => {
+    frame = 0;
+    const next = new Map<PmNode, Block>();
+    const nextLoose: StaticRange[] = [];
+    const { doc } = view.state;
+    const decos = view.isDestroyed ? [] : setOf(view.state)?.find(...nearView(doc)) ?? [];
+    for (let i = 0; i < decos.length;) {
+      const $from = doc.resolve(decos[i].from);
+      const node = $from.parent, start = $from.start(), end = $from.end();
+      const offsets: number[] = [];
+      const inBlock: Decoration[] = [];
+      for (; i < decos.length && decos[i].from <= end; i++) {
+        inBlock.push(decos[i]);
+        offsets.push(decos[i].from - start, decos[i].to - start);
+      }
+      const old = blocks.get(node);
+      if (old && !next.has(node) && old.offsets.join() === offsets.join()
+        && old.ranges.every((r) => r.startContainer.isConnected && r.endContainer.isConnected)) {
+        next.set(node, old);
+        blocks.delete(node);
+        continue;
+      }
+      const ranges = inBlock.map((d) => {
+        const from = view.domAtPos(d.from), to = view.domAtPos(d.to);
+        const r = new StaticRange({ startContainer: from.node, startOffset: from.offset, endContainer: to.node, endOffset: to.offset });
+        highlight.add(r);
+        return r;
+      });
+      if (next.has(node)) nextLoose.push(...ranges);
+      else next.set(node, { offsets, ranges });
+    }
+    drop();
+    blocks = next;
+    loose = nextLoose;
+  };
+  const update = () => { frame ||= requestAnimationFrame(paint); };
+  window.addEventListener('scroll', update, { capture: true, passive: true });
+  window.addEventListener('resize', update);
+  update();
+  return {
+    update,
+    destroy() {
+      window.removeEventListener('scroll', update, { capture: true });
+      window.removeEventListener('resize', update);
+      cancelAnimationFrame(frame);
+      drop();
+    },
+  };
 }
 
 // The misspelled-word range covering `pos`, if any — used by the context menu.
@@ -163,7 +259,7 @@ export const SpellCheck = Extension.create({
         },
         props: {
           decorations(state) {
-            return spellCheckKey.getState(state)?.set;
+            return HIGHLIGHTS ? null : spellCheckKey.getState(state)?.set;
           },
         },
         view(editorView) {
@@ -202,12 +298,15 @@ export const SpellCheck = Extension.create({
           const unsubscribe = spellController.subscribe(recheckAll);
           // Initial pass in case the checker is already loaded at mount.
           recheckAll();
+          const painter = paintHighlight(editorView, 'spell-error', (s) => spellCheckKey.getState(s)?.set);
 
           return {
             update(view, prevState) {
               if (!view.state.doc.eq(prevState.doc)) scheduleRecheck();
+              painter.update();
             },
             destroy() {
+              painter.destroy();
               if (timer !== undefined) clearTimeout(timer);
               unsubscribe();
             },

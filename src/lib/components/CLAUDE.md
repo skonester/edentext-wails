@@ -11,6 +11,7 @@ Only one view may measure and paginate in split or page-grid layouts. Plugin dec
 shared by multiple views must create their DOM in a widget factory, never reuse one node.
 `chromeMode` selects one of the modern toolbar island or `ribbon/`; both use
 `activeEditor`/`activeTick` and only one mounts at a time.
+Under the zh-Hans UI both size boxes list and accept the named sizes (字号, `utils/fontSize.ts`).
 
 Keep `pageBreaks.ts`, `Editor.svelte`, and `editor.css` layout constants aligned. Zoom is a
 CSS transform on `.paper`, while pagination always measures at 100%; reserve its scaled
@@ -20,3 +21,4 @@ Read `docs/architecture/components.md` before changing component data flow, pagi
 settling, split/grid views, zoom, headers/footers, review UI, templates, or debug tooling.
 Read the focused architecture document for ribbon, pagination, frames, tables, formatting,
 formulas, or notes before changing those areas.
+- Modal `<dialog>`s move by their `<h2>` title via `dragDialogs()` (`utils/dragWindow.ts`), modeless windows via `use:dragWindow`.

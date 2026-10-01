@@ -6,6 +6,9 @@ import { normalizeLeader, type TabAlign, type TabStop } from '../editor/extensio
 import { DEFAULT_NOTE_SETTINGS, type NoteKind, type NoteNumFormat, type NoteSettings } from '../storage/noteSettings';
 import { DEFAULT_WATERMARK, normalizePageDecor, type PageDecor, type Watermark } from '../storage/pageDecor';
 import { DEFAULT_LINE_NUMBERING, normalizeLineNumbering, type LineNumbering } from '../storage/lineNumbering';
+import { DEFAULT_LINE_GRID, normalizeLineGrid, type LineGrid } from '../storage/lineGrid';
+import { mainOfPair, tagFromOdf } from '../storage/documentLanguage';
+import { mostlyAsian } from '../utils/script';
 
 // LibreOffice's (and Word's) name for the watermark shape — what tells it apart from an
 // ordinary drawing in the header.
@@ -88,6 +91,10 @@ export function layerTextProps(base: PropMap, over: PropMap): PropMap {
     delete out['fo:font-family'];
     delete out['style:font-name'];
   }
+  if ('style:font-family-asian' in over || 'style:font-name-asian' in over) {
+    delete out['style:font-family-asian'];
+    delete out['style:font-name-asian'];
+  }
   return Object.assign(out, over);
 }
 
@@ -157,6 +164,12 @@ function entryFromStyleElement(el: Element): StyleEntry {
 // style:leader-style, for a file that names the line kind but no leader text.
 const ODF_LEADER: Record<string, string> = { dotted: '.', dash: '-', solid: '_' };
 
+// A style's or a run's western and asian language, each slot on its own; 'none' is none.
+export function langTagsOfProps(props: PropMap): { west: string | null; asian: string | null } {
+  const tag = (l: string | undefined, c: string | undefined) => (l && l !== 'none' ? tagFromOdf(l, c) : null);
+  return { west: tag(props['fo:language'], props['fo:country']), asian: tag(props['style:language-asian'], props['style:country-asian']) };
+}
+
 export class StyleResolver {
   // (family + '\0' + name) → entry; later registrations win (content.xml
   // automatic styles override styles.xml ones on name collision).
@@ -175,6 +188,7 @@ export class StyleResolver {
   private styleEls = new Map<string, Element>();
   private mergedCache = new Map<string, { text: PropMap; para: PropMap; misc: PropMap }>();
   private stylesDoc: Document | null;
+  private contentDoc: Document;
   private defaultMaster: string | null = null;
   private namedParagraphNames = new Set<string>();
   private namedTextNames = new Set<string>();
@@ -184,6 +198,7 @@ export class StyleResolver {
 
   constructor(contentDoc: Document, stylesDoc: Document | null) {
     this.stylesDoc = stylesDoc;
+    this.contentDoc = contentDoc;
     // Scan order (later wins): styles.xml named → styles.xml automatic →
     // content.xml named → content.xml automatic.
     const containers: Element[] = [];
@@ -371,25 +386,35 @@ export class StyleResolver {
     return styleName ? this.merged('graphic', styleName).para : {};
   }
 
-  // The document's default spell-check language, read from the base Standard
-  // paragraph style (falls back to the paragraph default-style). null when unset.
-  // The asian slot only where there is no western one: LibreOffice writes an asian default
-  // into every document, so it says nothing on its own — but a file that names the asian
-  // slot alone (as ours does for Chinese) is in that language.
-  documentLanguage(): { language: string; country: string } | null {
-    const props = this.merged('paragraph', 'Standard').text;
-    const language = props['fo:language'];
-    if (language && language !== 'none') return { language, country: props['fo:country'] ?? '' };
-    const asian = props['style:language-asian'];
-    if (!asian || asian === 'none') return null;
-    return { language: asian, country: props['style:country-asian'] ?? '' };
+  // The document's two default languages, read from the base Standard paragraph style
+  // (falls back to the paragraph default-style), and which of them is its main one
+  // (mainOfPair). Tags, null where unset.
+  documentLanguage(): { main: string | null; other: string | null; west: string | null; asian: string | null } {
+    if (!this.docLangs) {
+      const { west, asian } = langTagsOfProps(this.merged('paragraph', 'Standard').text);
+      const body = this.contentDoc.getElementsByTagNameNS(NS.office, 'text')[0];
+      this.docLangs = { ...mainOfPair(west, asian, mostlyAsian(body?.textContent ?? '')), west, asian };
+    }
+    return this.docLangs;
   }
+  private docLangs: { main: string | null; other: string | null; west: string | null; asian: string | null } | null = null;
 
   // Automatic hyphenation, from the same style — ODF counts it a text property, and
   // LibreOffice keeps it there rather than document-wide, so that style's value is
   // what "the document hyphenates" means.
   documentHyphenation(): boolean {
     return this.merged('paragraph', 'Standard').text['fo:hyphenate'] === 'true';
+  }
+
+  // The text grid of the first page's layout: "line" or "both" lays lines on it, one
+  // grid line being the base height plus the ruby line above it.
+  lineGrid(): LineGrid {
+    const props = this.pageLayoutEl()?.getElementsByTagNameNS(NS.style, 'page-layout-properties')[0] ?? null;
+    const mode = props?.getAttributeNS(NS.style, 'layout-grid-mode');
+    const base = lengthToPt(props?.getAttributeNS(NS.style, 'layout-grid-base-height'));
+    if ((mode !== 'line' && mode !== 'both') || !base) return DEFAULT_LINE_GRID;
+    const ruby = lengthToPt(props?.getAttributeNS(NS.style, 'layout-grid-ruby-height')) ?? 0;
+    return normalizeLineGrid({ on: true, pitchPt: base + ruby });
   }
 
   // The page-number format, from the page layout of the governing master page.
@@ -410,9 +435,16 @@ export class StyleResolver {
   // Resolve a text-props map's font: fo:font-family wins, else style:font-name
   // through the font-face declarations.
   fontFamilyOf(props: PropMap): string | null {
-    const fam = props['fo:font-family'];
-    if (fam) return fam.split(',')[0].trim().replace(/^['"]|['"]$/g, '') || null;
-    const name = props['style:font-name'];
+    return this.fontOf(props['fo:font-family'], props['style:font-name']);
+  }
+
+  // The asian slot's font (Chinese, Japanese and Korean text), resolved the same way.
+  asianFontOf(props: PropMap): string | null {
+    return this.fontOf(props['style:font-family-asian'], props['style:font-name-asian']);
+  }
+
+  private fontOf(family: string | undefined, name: string | undefined): string | null {
+    if (family) return family.split(',')[0].trim().replace(/^['"]|['"]$/g, '') || null;
     if (name) return this.fontFaces.get(name) ?? name;
     return null;
   }

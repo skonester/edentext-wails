@@ -28,7 +28,9 @@ const FORMATS: Record<Kind, { mime: string; type: { description: string; accept:
 };
 
 // The open picker also accepts templates; opening one never binds it as the file.
+// The picker preselects the first entry, so it lists both formats together.
 const OPEN_PICKER_TYPES = [
+  { description: 'Text Document', accept: { [ODT_MIME]: ['.odt'], [OTT_MIME]: ['.ott'], [DOCX_MIME]: ['.docx'], [DOTX_MIME]: ['.dotx'] } },
   { description: 'OpenDocument Text', accept: { [ODT_MIME]: ['.odt'], [OTT_MIME]: ['.ott'] } },
   { description: 'Word Document', accept: { [DOCX_MIME]: ['.docx'], [DOTX_MIME]: ['.dotx'] } },
 ];

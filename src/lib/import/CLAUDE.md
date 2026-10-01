@@ -24,17 +24,26 @@ editor defaults must remain implicit, or each round trip accumulates formatting.
 Fit imported content to the editor schema without changing its semantic role: paragraph,
 heading, list, table, frame, note, and field paths have separate constraints. Keep ODF and
 DOCX behavior aligned unless the formats expose an unavoidable difference.
+`repairContent.ts` checks the imported body against the schema on open; content it rejects is
+refitted and reported as a warning. It is a safety net: an importer still emits valid structure.
 
-Both formats carry western, asian and complex-script text properties side by side, and a
-run's font and size come from the set its own characters belong to (`scriptProps` in
-`odt.ts`, `ASIAN_SCRIPT_RE`). The choice is per ODF text node and per DOCX run, so a run
-mixing Latin and CJK takes the asian font throughout; DOCX has an asian font name only
-(`w:rFonts w:eastAsia`), no asian size or weight, and its complex-script set is not read.
+Both formats carry western, asian and complex-script text properties side by side. The
+**font** is read as a pair: `fontFamily` from the western slot, `fontFamilyAsian` from the
+asian one (`style:font-name-asian`, `w:rFonts w:eastAsia`), on every run whatever its script,
+each suppressed against its own half of the style chain (`fonts`/`asianFonts`). Size, weight
+and slant still come from the set the run's own characters belong to (`scriptProps`,
+`ASIAN_SCRIPT_RE`), per ODF text node; DOCX has no asian size or weight, and its
+complex-script set is not read. The default style's asian font is dropped where it is the
+western one or the language's Han default (`dropDefaultAsianFont`) — what an export writes back
+unasked. The **language** is a pair the same way: `lang` from `fo:language`/`w:val`,
+`langAsian` from `style:language-asian`/`w:eastAsia`, each suppressed against its own default
+(`BlockDefaults.lang`/`langAsian`); DOCX's `RunProps` keeps them apart (`langEastAsia`) so a
+run naming one inherits the other. The document's main language is the asian default where
+the body is mostly East Asian (`mainOfPair`, `mostlyAsian`), the other one `languageOther`.
 
-A header/footer zone is one paragraph, so a **text box** anchored in one has no block to
-live in: ODF makes its paragraphs lines of the zone, DOCX trails its text on the zone's
-own line behind a tab at the stop the box's anchor asks for. Dropping the box whole loses
-what Word's page-number gallery puts there — a PAGE field, on every page of the document.
+A header/footer zone converts through the body's block converter (`'zone'` kind, a
+`zone` ctx flag), so a **text box** anchored in one keeps its PAGE field — what Word's
+page-number gallery puts there, on every page of the document.
 
 The `sectionBreak` marker is **ordinal** — the editor counts the blocks carrying it to
 index the header/footer sets — and only a paragraph, a heading, a table or an index

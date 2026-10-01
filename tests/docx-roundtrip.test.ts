@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { zipSync, strToU8, unzipSync, strFromU8 } from 'fflate';
 import { buildDocx } from '../src/lib/export/docx';
 import { importDocx } from '../src/lib/import/docx';
+import { buildOdt } from '../src/lib/export/odt';
+import { importOdt } from '../src/lib/import/odt';
 import { builtinStyleSheet } from '../src/lib/styles/styleSheet';
 import { HEADER_SHADE } from '../src/lib/editor/extensions/tableHeaderRow';
 
@@ -45,6 +47,8 @@ describe('DOCX export → import round trip', () => {
         text('petite ', [{ type: 'textStyle', attrs: { caps: 'smallCaps' } }]),
         text('dotted ', [{ type: 'underline', attrs: { lineStyle: 'dotted', lineColor: '#FF0000' } }]),
         text('crossed ', [{ type: 'strike', attrs: { lineStyle: 'double' } }]),
+        text('stressed ', [{ type: 'textStyle', attrs: { emphasis: 'dot below' } }]),
+        text('ringed ', [{ type: 'textStyle', attrs: { emphasis: 'circle above' } }]),
         text('raised', [{ type: 'textStyle', attrs: { fontSize: '14pt', textPosition: 3 } }]),
       ]),
       { type: 'paragraph', attrs: { fontSize: '22pt', textAlign: 'center' } }, // empty sized line
@@ -309,7 +313,7 @@ describe('DOCX export → import round trip', () => {
     expect(mlSub.attrs?.listStyleType ?? null).toBe(null);
   });
 
-  it('round-trips the character effects (case, line shapes, raised run)', () => {
+  it('round-trips the character effects (case, line shapes, emphasis, raised run)', () => {
     const runs = walk(doc, 'text');
     const of = (t: string) => runs.find((r: N) => r.text === t)!.marks!;
     const attrs = (t: string, type: string) => of(t).find((m: N) => m.type === type)!.attrs!;
@@ -318,6 +322,18 @@ describe('DOCX export → import round trip', () => {
     expect(attrs('dotted ', 'underline')).toMatchObject({ lineStyle: 'dotted', lineColor: '#FF0000' });
     expect(attrs('crossed ', 'strike').lineStyle).toBe('double');
     expect(attrs('raised', 'textStyle').textPosition).toBe(3);
+    expect(documentXml).toMatch(/<w:em w:val="underDot"\/>/);
+    expect(attrs('stressed ', 'textStyle').emphasis).toBe('dot below');
+    expect(attrs('ringed ', 'textStyle').emphasis).toBe('circle above');
+  });
+
+  it("reads Word's emphasis marks as LibreOffice does", async () => {
+    const files = unzipSync(await buildDocx({ type: 'doc', content: [para('a'), para('b')] }));
+    const vals = ['dot', 'none'];
+    let i = 0;
+    files['word/document.xml'] = strToU8(strFromU8(files['word/document.xml']).replace(/<w:r>/g, () => `<w:r><w:rPr><w:em w:val="${vals[i++]}"/></w:rPr>`));
+    const runs = walk(importDocx(zipSync(files)).content, 'text');
+    expect(runs.map((r: N) => markAttrs(r, 'textStyle')?.emphasis ?? null)).toEqual(['dot above', null]);
   });
 
   it('round-trips the image (size + floating wrap)', () => {
@@ -382,6 +398,16 @@ describe('DOCX export → import round trip', () => {
     expect(walk(result.footer, 'pageNumber').length).toBe(1);
     expect(walk(result.footer, 'pageCount').length).toBe(1);
   });
+});
+
+// A margin in twips comes back as the same twip, and one typed in cm as typed.
+it('keeps a page margin to the twip', async () => {
+  const doc = { type: 'doc', content: [{ type: 'paragraph' }] };
+  const out = await buildDocx(doc as never, { top: 2.5, bottom: 2.5, left: 3.175, right: 3.175 });
+  const again = importDocx(out);
+  expect([again.margins.top, again.margins.left]).toEqual([2.5, 3.175]);
+  const xml = strFromU8(unzipSync(await buildDocx(doc as never, again.margins))['word/document.xml']);
+  expect(xml).toMatch(/<w:pgMar [^>]*w:left="1800"/);
 });
 
 describe('DOCX different first page (w:titlePg)', () => {
@@ -626,6 +652,7 @@ describe('DOCX import: alignment inherited from a paragraph style', () => {
     <w:p><w:r><w:t>Inherits justify from Standard</w:t></w:r></w:p>
     <w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>Direct center wins</w:t></w:r></w:p>
     <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Heading based on Standard</w:t></w:r></w:p>
+    <w:p><w:pPr><w:jc w:val="left"/></w:pPr><w:r><w:t>Direct left wins</w:t></w:r></w:p>
     <w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:bottom="1440" w:left="1440" w:right="1440"/></w:sectPr>
   </w:body></w:document>`;
   const stylesXml = `<?xml version="1.0"?><w:styles ${W}>
@@ -640,8 +667,11 @@ describe('DOCX import: alignment inherited from a paragraph style', () => {
     expect(doc.content![0].attrs?.textAlign).toBeUndefined();
     expect(res.styles.paragraph['Standard'].para.textAlign).toBe('justify');
   });
-  it('lets a direct w:jc override the style', () => {
+  it('lets a direct w:jc override the style, the page\'s own edge too', async () => {
     expect(doc.content![1].attrs.textAlign).toBe('center');
+    expect(doc.content![3].attrs.textAlign).toBe('left');
+    const odt = importOdt(await buildOdt(doc, undefined, 'portrait', undefined, null, 'A4', res.styles));
+    expect((odt.content as N).content[3].attrs.textAlign).toBe('left');
   });
   it('leaves a heading based on the default style free of direct alignment', () => {
     expect(doc.content![2].type).toBe('heading');
@@ -1031,6 +1061,42 @@ describe('DOCX import: a mid-body section break starts a new page', () => {
     const two = round.content!.find((n) => walk(n, 'text').some((t) => t.text === 'section two'))!;
     expect(two.attrs?.breakBefore).toBe('page');
   });
+});
+
+describe('DOCX import: a page break before a table', () => {
+  const W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
+  const tbl = (pPr = '') => `<w:tbl><w:tr><w:tc><w:p>${pPr}<w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>`;
+  const build = (body: string) => importDocx(zipSync({ 'word/document.xml': strToU8(
+    `<?xml version="1.0"?><w:document ${W}><w:body><w:p><w:r><w:t>cover</w:t></w:r></w:p>${body}<w:sectPr/></w:body></w:document>`) })).content as N;
+  const table = (doc: N) => doc.content!.find((n) => n.type === 'table')!;
+
+  it('moves the table when the paragraph above ends in a break', () => {
+    expect(table(build(`<w:p><w:r><w:br w:type="page"/></w:r></w:p>${tbl()}`)).attrs?.breakBefore).toBe('page');
+  });
+
+  it("reads the first cell's pageBreakBefore as the table's, and writes it back there", async () => {
+    const doc = build(tbl('<w:pPr><w:pageBreakBefore/></w:pPr>'));
+    expect(table(doc).attrs?.breakBefore).toBe('page');
+    const round = importDocx(await buildDocx(doc as never)).content as N;
+    expect(table(round).attrs?.breakBefore).toBe('page');
+    expect(walk(table(round), 'paragraph')[0].attrs?.breakBefore).toBeFalsy();
+  });
+});
+
+describe('DOCX import: a watermark only from a header a page shows', () => {
+  const NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:v="urn:schemas-microsoft-com:vml"';
+  const build = (type: string, titlePg: boolean) => importDocx(zipSync({
+    'word/document.xml': strToU8(`<?xml version="1.0"?><w:document ${NS}><w:body><w:p/><w:sectPr>`
+      + `<w:headerReference w:type="${type}" r:id="rIdH"/>${titlePg ? '<w:titlePg/>' : ''}</w:sectPr></w:body></w:document>`),
+    'word/_rels/document.xml.rels': strToU8('<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+      + '<Relationship Id="rIdH" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/></Relationships>'),
+    'word/header1.xml': strToU8(`<?xml version="1.0"?><w:hdr ${NS}><w:p><w:r><w:pict><v:shape id="PowerPlusWaterMarkObject1">`
+      + '<v:textpath string="DRAFT"/></v:shape></w:pict></w:r></w:p></w:hdr>'),
+  })).decor as { watermark: { text: string } | null };
+
+  it('takes it from the default header', () => expect(build('default', false).watermark?.text).toBe('DRAFT'));
+  it('takes it from a first-page header under titlePg', () => expect(build('first', true).watermark?.text).toBe('DRAFT'));
+  it('leaves it off when the first-page header is not in use', () => expect(build('first', false).watermark).toBeNull());
 });
 
 describe('DOCX named paragraph styles', () => {

@@ -11,7 +11,7 @@
   "info": {
     "companyName": "EdenText",
     "productName": "EdenText",
-    "productVersion": "0.6.0",
+    "productVersion": "0.7.0",
     "copyright": "AGPL-3.0-only",
     "comments": "A rich-text editor that saves .odt and .docx",
     "fileAssociations": [

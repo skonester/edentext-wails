@@ -34,7 +34,7 @@ export const FontWeight = Extension.create({
             },
             renderHTML: attributes => {
               if (!attributes.fontWeight) return {};
-              return { style: `font-weight: ${attributes.fontWeight}` };
+              return { style: `font-weight: ${attributes.fontWeight}; -webkit-text-stroke-width: 0` };
             },
           },
         },
